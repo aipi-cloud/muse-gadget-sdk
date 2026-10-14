@@ -1,3 +1,28 @@
+## AIPI fork (aipi-cloud)
+
+This is AIPI's fork of `facebookincubator/muse-gadget-sdk` (base commit
+`812c46f`), published to satisfy the Apache 2.0 source obligation for the
+firmware AIPI ships on the AIPI Lite. Changes on top of upstream:
+
+- SDK token from NVS, set over USB (`>sdk.token=`) - see `docs/FIRMWARE_CONTRACT.md`
+- TTS service setup over USB (`>tts.*=`), release builds ship placeholders
+- Status fields (`sdk_token`, `tts`) and the 128 px AIPI Lite screens
+- The Jollybot avatar has been replaced with AIPI's own placeholder character
+  (`tools/muse/AVATAR_RECIPE.md`); the Meta-owned `jollybot.gif` asset must not
+  be redistributed
+
+Build the AIPI Lite profile:
+
+```sh
+cd esp32
+tools/muse/board.sh build aipi        # -> build-muse-aipi/
+```
+
+Firmware binaries distributed by AIPI are built from this repository and
+published at the [Muse on AIPI installer](https://aipi.com). Upstream project
+and licence below.
+
+---
 <!--
 Copyright (c) Meta Platforms, Inc. and affiliates.
 
