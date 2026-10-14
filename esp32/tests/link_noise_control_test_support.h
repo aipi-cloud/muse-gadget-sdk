@@ -72,8 +72,7 @@ class TestCrypto : public CryptoBackend {
 static TestCrypto crypto;
 static std::unique_ptr<ClientSession> noise_session;
 static uint8_t svc_scratch[12288], env_scratch[12288];
-// The session writes its payload WS_HEADROOM (32) bytes into ws_buf.
-alignas(32) static uint8_t ws_buf[32 + ClientSession::kMaxOutboundWebSocketPayloadSize];
+static uint8_t ws_buf[ClientSession::kMaxOutboundWebSocketPayloadSize];
 static void reset_noise_session() {
     crypto = TestCrypto{};
     noise_session = std::make_unique<ClientSession>(crypto);

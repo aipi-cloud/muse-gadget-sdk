@@ -23,6 +23,8 @@
 #include "esp_mac.h"
 #include "esp_log.h"
 
+#include "config_store.h"
+
 static const char *TAG = "link.identity";
 
 // Device identity. The device advertises over BLE as "MuseGadget-XXXXXX" and
@@ -38,6 +40,10 @@ static char s_node_id[32];
 static char s_ble_name[32];
 static char s_mac[18];
 static char s_device_id[48];
+/* NVS-supplied token (FIRMWARE_CONTRACT.md §1): filled by identity_init()
+ * when the compiled-in CONFIG_GADGET_SDK_TOKEN is empty, which is the
+ * release form - the website writes ">sdk.token=mgst_..." over USB. */
+static char s_sdk_token[64];
 
 void identity_init(void) {
     uint8_t mac[6] = {0};
@@ -52,6 +58,18 @@ void identity_init(void) {
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     snprintf(s_device_id, sizeof(s_device_id), "hatch-link:%s", s_mac);
     ESP_LOGI(TAG, "node_id=%s ble_name=%s", s_node_id, s_ble_name);
+
+    s_sdk_token[0] = '\0';
+    if (!CONFIG_GADGET_SDK_TOKEN[0]) {
+        /* config_store_init() has run by now (app.c): the token the website
+         * wrote over USB is picked up for pairing and token refresh. */
+        if (config_get_str("sdk_token", s_sdk_token, sizeof(s_sdk_token)) && s_sdk_token[0]) {
+            ESP_LOGI(TAG, "SDK token loaded from NVS: %.12s", s_sdk_token);
+        } else {
+            s_sdk_token[0] = '\0';
+            ESP_LOGW(TAG, "no SDK token in NVS yet; pairing waits for >sdk.token=");
+        }
+    }
 }
 
 const char *identity_node_id(void) { return s_node_id; }
@@ -59,5 +77,8 @@ const char *identity_ble_name(void) { return s_ble_name; }
 const char *identity_mac(void) { return s_mac; }
 const char *identity_device_id(void) { return s_device_id; }
 const char *identity_sdk_token(void) {
-    return CONFIG_GADGET_SDK_TOKEN[0] ? CONFIG_GADGET_SDK_TOKEN : NULL;
+    if (CONFIG_GADGET_SDK_TOKEN[0]) {
+        return CONFIG_GADGET_SDK_TOKEN;
+    }
+    return s_sdk_token[0] ? s_sdk_token : NULL;
 }

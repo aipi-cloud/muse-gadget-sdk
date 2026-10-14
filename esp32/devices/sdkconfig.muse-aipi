@@ -64,3 +64,12 @@ CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 # actually slept, and how long each power lock kept the chip awake.
 CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
 CONFIG_PM_PROFILING=y
+
+# Release form (FIRMWARE_CONTRACT.md): no token compiled in; the website writes
+# it over USB (">sdk.token=") into NVS. An empty token is expected here, so the
+# build must not warn; validate_config.cmake still rejects malformed tokens.
+CONFIG_GADGET_SDK_TOKEN=""
+# CONFIG_GADGET_SDK_TOKEN_WARN is not set
+
+# QR code on the Offline/Error screen (FIRMWARE_CONTRACT.md §4).
+CONFIG_LV_USE_QRCODE=y

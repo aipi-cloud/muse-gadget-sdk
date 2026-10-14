@@ -33,7 +33,6 @@
 
 #include "muse_ble.h"
 #include "muse_board.h"
-#include "muse_input.h"
 #include "muse_chat.h"
 #include "muse_console.h"
 #include "muse_link.h"
@@ -92,22 +91,7 @@ static int s_canvas_px;     /* Muse's size on screen */
 static int s_dy;            /* full layout: offset from a 466 px tall screen */
 static lv_indev_t *s_indev;
 static lv_obj_t *s_tv;
-/* True while the face tile is the visible tile. Updated in the LVGL task;
- * read from any task (single word, benign if briefly stale). */
-static volatile bool s_face_active = true;
 static lv_obj_t *s_face;
-
-static void tile_changed_cb(lv_event_t *e)
-{
-    lv_obj_t *tv = lv_event_get_target(e);
-    s_face_active = (lv_tileview_get_tile_active(tv) == s_face);
-}
-
-/* From any task: the face tile is the currently visible tile. */
-bool muse_ui_face_active(void)
-{
-    return s_face_active;
-}
 static lv_obj_t *s_settings;
 static lv_obj_t *s_dots[2];
 static lv_obj_t *s_wifi_icon;
@@ -117,6 +101,11 @@ static lv_obj_t *s_pair;
 static lv_obj_t *s_pair_code;
 static lv_obj_t *s_pair_title;
 static lv_obj_t *s_pair_hint;
+static lv_obj_t *s_pair_sub;    /* "MuseGadget-" above the large code */
+static lv_obj_t *s_pair_qr;     /* Offline/Error help QR (CONFIG_LV_USE_QRCODE) */
+static int s_pair_mode = -1;    /* pair_card_mode_t last shown */
+static float s_confirm_at;      /* when the 60 s confirm countdown started */
+static int s_confirm_left = -1; /* seconds last shown */
 static lv_obj_t *s_canvas;
 static lv_obj_t *s_mic_icon;
 static lv_obj_t *s_ptt_hint, *s_spk_hint, *s_pwr_hint;
@@ -449,21 +438,6 @@ static void set_mic_color(uint32_t color)
     color_mic(s_mic_icon, color);   /* legacy face icon only */
 }
 
-static void on_touch_mic(lv_event_t *e)
-{
-    switch (lv_event_get_code(e)) {
-    case LV_EVENT_PRESSED:
-        muse_input_touch_talk(true);
-        break;
-    case LV_EVENT_RELEASED:
-    case LV_EVENT_PRESS_LOST:
-        muse_input_touch_talk(false);
-        break;
-    default:
-        break;
-    }
-}
-
 /* Icons beside the physical buttons, in place of an instruction caption. */
 static void build_button_icons(lv_obj_t *face)
 {
@@ -472,14 +446,6 @@ static void build_button_icons(lv_obj_t *face)
     s_mic_icon = make_mic(face, s_tall ? 24 : s_small ? 12 : 26);
     lv_obj_align(s_mic_icon, t->align, t->x, t->y);
     set_mic_color(COLOR_DIM);
-    if (muse_board->touch_talk) {
-        lv_obj_add_flag(s_mic_icon, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_ext_click_area(s_mic_icon, 12);
-        for (uint32_t i = 0; i < lv_obj_get_child_count(s_mic_icon); i++) {
-            lv_obj_remove_flag(lv_obj_get_child(s_mic_icon, i), LV_OBJ_FLAG_CLICKABLE);
-        }
-        lv_obj_add_event_cb(s_mic_icon, on_touch_mic, LV_EVENT_ALL, NULL);
-    }
 
     /* Without touch the aux button opens the menu rather than sleeping. A board
      * that leaves aux_hint out has no button to put an icon beside. */
@@ -868,7 +834,6 @@ static void build_screen(void)
         lv_obj_set_style_bg_color(s_face, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_face, LV_OPA_COVER, 0);
         s_settings = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT);
-        lv_obj_add_event_cb(s_tv, tile_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
         face = s_face;
     }
 
@@ -1081,10 +1046,6 @@ static void on_camera_hint_clicked(lv_event_t *e)
 static void on_any_press(lv_event_t *e)
 {
     (void)e;
-    if (muse_board->touch_talk && muse_link_state() == MUSE_LINK_CONFIRM) {
-        muse_input_touch_talk(true);
-        muse_input_touch_talk(false);
-    }
     muse_state_poke();
 }
 
@@ -1174,8 +1135,16 @@ static void build_overlays(void)
     }
 
     /* BLE pairing code, or the Muse app's ask for the talk button: a centred
-     * column in one typeface, the code large. The small card grows with the hint. */
-    s_pair = lv_obj_create(lv_layer_top());
+     * column in one typeface, the code large. The small card grows with the hint.
+     * The same card carries the contract's screens (FIRMWARE_CONTRACT.md §4):
+     * the pick-code prompt, the confirm countdown, joining, and the help QR.
+     * Child order: title, sub, code, qr, hint - hidden children leave the rest
+     * in the right order for every mode. */
+    /* On the screen itself rather than the top layer: it still covers the face
+     * (built earlier), and the bench snapshot (lv_snapshot_take of the active
+     * screen) can then capture the pairing screens for verification. The sleep
+     * cover above stays on the top layer and covers this too. */
+    s_pair = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(s_pair);
     lv_obj_set_size(s_pair, s_small ? s_w - 8 : 300, s_small ? LV_SIZE_CONTENT : 150);
     lv_obj_center(s_pair);
@@ -1193,8 +1162,20 @@ static void build_overlays(void)
     lv_obj_add_flag(s_pair, LV_OBJ_FLAG_HIDDEN);
     s_pair_title = make_label(s_pair, font_pick(&lv_font_montserrat_20, FONT_COMPACT), COLOR_LIT);
     lv_label_set_text(s_pair_title, "Pairing code");
+    /* Wraps: "In the Muse app, pick" is wider than the AIPI's card. */
+    lv_obj_set_width(s_pair_title, lv_pct(100));
+    lv_label_set_long_mode(s_pair_title, LV_LABEL_LONG_MODE_WRAP);
+    s_pair_sub = make_label(s_pair, s_small ? &lv_font_unscii_8 : &lv_font_unscii_16, COLOR_DIM);
+    lv_obj_add_flag(s_pair_sub, LV_OBJ_FLAG_HIDDEN);
     s_pair_code = make_label(s_pair, font_pick(&lv_font_montserrat_28, &lv_font_montserrat_20), COLOR_ACCENT);
     lv_obj_set_style_text_letter_space(s_pair_code, s_small ? 2 : 6, 0);
+#if LV_USE_QRCODE
+    s_pair_qr = lv_qrcode_create(s_pair);
+    lv_qrcode_set_size(s_pair_qr, 66);   /* QR version 2 at scale 2, with quiet zone */
+    lv_qrcode_set_dark_color(s_pair_qr, lv_color_black());
+    lv_qrcode_set_light_color(s_pair_qr, lv_color_white());
+    lv_obj_add_flag(s_pair_qr, LV_OBJ_FLAG_HIDDEN);
+#endif
     s_pair_hint = make_label(s_pair, font_pick(&lv_font_montserrat_14, FONT_COMPACT), COLOR_DIM);
     lv_label_set_text(s_pair_hint, s_small ? "Enter on phone" : "Enter it on your phone");
     /* Wraps: "bottom right button" is wider than the AIPI's card. */
@@ -1353,30 +1334,126 @@ static void update_chrome(float now)
         lv_label_set_text(s_name_lbl, shown);
     }
 
-    /* The same card asks for the talk button when the Muse app pairs. */
-    bool confirm = !b.passkey && muse_link_state() == MUSE_LINK_CONFIRM;
-    if (b.passkey || confirm) {
-        char code[24], hint[40];
-        if (confirm) {
-            if (muse_board->touch_talk || !muse_board->audio_init) {
-                strlcpy(code, "Tap screen", sizeof(code));
-                strlcpy(hint, "Tap to confirm pairing", sizeof(hint));
-            } else {
-                strlcpy(code, s_small ? "Press" : "Press button", sizeof(code));
-                snprintf(hint, sizeof(hint), s_small ? "%s button" : "Press the %s button", muse_board->talk_button);
-            }
-        } else {
-            snprintf(code, sizeof(code), "%06lu", (unsigned long)b.passkey);
-            strlcpy(hint, s_small ? "Enter on phone" : "Enter it on your phone", sizeof(hint));
-        }
-        const char *title = confirm ? (s_small ? "Muse app" : "Pair with Muse app") : "Pairing code";
-        if (strcmp(code, lv_label_get_text(s_pair_code)) != 0) {
-            lv_label_set_text(s_pair_code, code);
-            lv_label_set_text(s_pair_title, title);
-            lv_label_set_text(s_pair_hint, hint);
+    /* FIRMWARE_CONTRACT.md §4: one card, the contract's screens. The card is
+     * hidden while the menu is open so it never blocks navigation. */
+    enum { CARD_NONE, CARD_CODE, CARD_PASSKEY, CARD_CONFIRM, CARD_JOIN, CARD_HELP };
+    int card;
+    if (b.passkey) {
+        card = CARD_PASSKEY;
+    } else {
+        switch (muse_link_state()) {
+        case MUSE_LINK_UNPAIRED:
+        case MUSE_LINK_PAIRING:
+            card = CARD_CODE;   /* "In the Muse app, pick" + this gadget's code */
+            break;
+        case MUSE_LINK_CONFIRM:
+            card = CARD_CONFIRM;
+            break;
+        case MUSE_LINK_CONNECTING:
+            card = CARD_JOIN;
+            break;
+        case MUSE_LINK_OFFLINE:
+        case MUSE_LINK_ERROR:
+            card = CARD_HELP;
+            break;
+        default:
+            card = CARD_NONE;
+            break;
         }
     }
-    lv_obj_set_flag(s_pair, LV_OBJ_FLAG_HIDDEN, !b.passkey && !confirm);
+    if (muse_menu_is_open()) {
+        card = CARD_NONE;
+    }
+
+    if (card != s_pair_mode) {
+        bool sub = false, code_vis = true, qr = false;
+        const char *tail = b.name;
+        const char *dash = b.name[0] ? strrchr(b.name, '-') : NULL;
+        if (dash && dash[1]) {
+            tail = dash + 1;
+        }
+        switch (card) {
+        case CARD_CODE: {
+            char prefix[20] = "";
+            if (dash) {
+                size_t n = (size_t)(dash - b.name) + 1;
+                if (n < sizeof(prefix)) {
+                    memcpy(prefix, b.name, n);
+                    prefix[n] = '\0';
+                }
+            }
+            lv_label_set_text(s_pair_title, "In the Muse app, pick");
+            lv_label_set_text(s_pair_sub, prefix);
+            sub = prefix[0] != '\0';
+            lv_label_set_text(s_pair_code, tail);
+            lv_label_set_text(s_pair_hint, "Ready to pair");
+            break;
+        }
+        case CARD_PASSKEY:
+            lv_label_set_text(s_pair_title, "Pairing code");
+            lv_label_set_text_fmt(s_pair_code, "%06lu", (unsigned long)b.passkey);
+            lv_label_set_text(s_pair_hint, s_small ? "Enter on phone" : "Enter it on your phone");
+            break;
+        case CARD_CONFIRM:
+            if (!muse_board->audio_init) {
+                lv_label_set_text(s_pair_code, "Tap screen");
+                lv_label_set_text(s_pair_hint, "Tap to confirm pairing");
+            } else {
+                lv_label_set_text(s_pair_code, s_small ? "Press" : "Press button");
+#if CONFIG_MUSE_BOARD_AIPI
+                /* The guide tells AIPI owners to press the right button (§4). */
+                lv_label_set_text(s_pair_hint, LV_SYMBOL_RIGHT " the right button");
+#else
+                lv_label_set_text_fmt(s_pair_hint, "Press the %s button", muse_board->talk_button);
+#endif
+            }
+            lv_label_set_text(s_pair_title, "60 s");
+            s_confirm_at = now;
+            s_confirm_left = -1;
+            break;
+        case CARD_JOIN:
+            lv_label_set_text(s_pair_title, "Joining Wi-Fi…");
+            lv_label_set_text(s_pair_hint, "then connecting to Muse");
+            code_vis = false;
+            break;
+        case CARD_HELP:
+            lv_label_set_text(s_pair_title, "Can't reach Muse");
+            lv_label_set_text(s_pair_hint, "Scan for help");
+            code_vis = false;
+            qr = true;
+#if LV_USE_QRCODE
+            /* Uppercase keeps it short: this fits a version-2 QR (§4). */
+            {
+                char url[64];
+                snprintf(url, sizeof(url), "HTTPS://AIPI.COM/M/%s", tail);
+                lv_qrcode_set_data(s_pair_qr, url);
+            }
+#endif
+            break;
+        default:
+            break;
+        }
+        lv_obj_set_flag(s_pair_sub, LV_OBJ_FLAG_HIDDEN, !sub);
+        lv_obj_set_flag(s_pair_code, LV_OBJ_FLAG_HIDDEN, !code_vis);
+#if LV_USE_QRCODE
+        lv_obj_set_flag(s_pair_qr, LV_OBJ_FLAG_HIDDEN, !qr);
+#else
+        (void)qr;
+#endif
+        s_pair_mode = card;
+    }
+    /* The 60 s confirm window, counted down on the card (§4). */
+    if (card == CARD_CONFIRM) {
+        int left = 60 - (int)(now - s_confirm_at);
+        if (left < 0) {
+            left = 0;
+        }
+        if (left != s_confirm_left) {
+            lv_label_set_text_fmt(s_pair_title, "%d s", left);
+            s_confirm_left = left;
+        }
+    }
+    lv_obj_set_flag(s_pair, LV_OBJ_FLAG_HIDDEN, card == CARD_NONE);
 
     bool speaker = muse_settings_speaker_on();   /* also set from settings, the phone and serial */
     if (s_speaker && (int)speaker != s_shown_speaker) {

@@ -59,18 +59,14 @@ def read(request: dict) -> dict:
     with open(path, "rb") as f:
         size = os.fstat(f.fileno()).st_size
         f.seek(offset)
-        # procfs reports zero and sysfs often reports a page, regardless of
-        # the content length. Look ahead one byte to find the actual EOF.
-        data = f.read(limit + 1)
-    eof = len(data) <= limit
-    data = data[:limit]
+        data = f.read(limit)
     next_offset = offset + len(data)
     return {
         "path": path,
         "size": size,
         "offset": offset,
         "next_offset": next_offset,
-        "eof": eof,
+        "eof": next_offset >= size,
         "data_b64": base64.b64encode(data).decode("ascii"),
     }
 

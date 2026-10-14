@@ -52,6 +52,7 @@
 #include "esp_attr.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -70,6 +71,7 @@ extern "C" {
 #include "muse_link.h"
 #include "muse_settings.h"
 #include "muse_wifi.h"
+#include "nvs.h"
 }
 #include "muse_chat_priv.h"
 
@@ -1501,6 +1503,152 @@ static void on_chat_ack(stream_t *s)
 
 /* ---- Turn: speech ---- */
 
+static void tts_data(const uint8_t *data, size_t len);
+
+/* ---- Speech: StepFun TTS (AIPI official build) ----
+ *
+ * Muse replies as text. To speak them, the message's text goes to StepFun's
+ * /v1/audio/speech and the MP3 comes back whole: this blocks the session task
+ * for a few seconds (well inside TURN_CAP_US and DEAD_US), then hands the
+ * MP3 to decode() as a streamed one would. On any failure (offline, quota,
+ * bad status) the turn falls back to reading-pace silence, so a broken TTS
+ * never breaks the reply.
+ */
+
+/* Release builds ship these as placeholders: every owner brings their own TTS
+ * service through ">tts.*=" over USB (FIRMWARE_CONTRACT.md §3); step_tts_fetch()
+ * reads NVS first and falls back to these compiled-in values. */
+#define STEP_TTS_URL ""
+#define STEP_TTS_MODEL ""
+/* No key ships in the firmware. Internal test builds fill this from a local,
+ * uncommitted config; rotate the StepFun key if one ever leaks. */
+#define STEP_TTS_KEY ""
+#define STEP_TTS_VOICE ""
+#define STEP_TTS_TIMEOUT_MS 20000
+
+/* NVS value first, compiled-in macro second (FIRMWARE_CONTRACT.md §3). The
+ * keys live in main/'s "homehub" namespace; see the note in muse_input.c. */
+static void step_tts_field(const char *key, const char *fallback, char *out, size_t cap)
+{
+    out[0] = '\0';
+    nvs_handle_t h;
+    if (nvs_open("homehub", NVS_READONLY, &h) == ESP_OK) {
+        size_t len = cap;
+        if (nvs_get_str(h, key, out, &len) != ESP_OK) {
+            out[0] = '\0';
+        }
+        nvs_close(h);
+    }
+    if (!out[0]) {
+        strlcpy(out, fallback, cap);
+    }
+}
+
+static bool step_tts_fetch(const char *text, uint8_t **out, size_t *out_len)
+{
+    *out = nullptr;
+    *out_len = 0;
+    if (!muse_wifi_connected()) {
+        return false;
+    }
+
+    char url[256], key[256], model[64], voice[64];
+    step_tts_field("tts_url", STEP_TTS_URL, url, sizeof(url));
+    step_tts_field("tts_key", STEP_TTS_KEY, key, sizeof(key));
+    step_tts_field("tts_model", STEP_TTS_MODEL, model, sizeof(model));
+    step_tts_field("tts_voice", STEP_TTS_VOICE, voice, sizeof(voice));
+    if (!url[0]) {
+        return false;   /* nothing configured: the text-only fallback keeps the reply */
+    }
+
+    cJSON *body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "model", model);
+    cJSON_AddStringToObject(body, "input", text);
+    cJSON_AddStringToObject(body, "response_format", "mp3");
+    cJSON_AddStringToObject(body, "voice", voice);
+    char *json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!json) {
+        return false;
+    }
+    size_t jlen = strlen(json);
+
+    esp_http_client_config_t cfg = {};
+    cfg.url = url;
+    cfg.method = HTTP_METHOD_POST;
+    cfg.timeout_ms = STEP_TTS_TIMEOUT_MS;
+    cfg.buffer_size = 4096;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        free(json);
+        return false;
+    }
+    bool ok = false;
+    do {
+        char auth[264];   /* fits the 255-char key slot */
+        snprintf(auth, sizeof(auth), "Bearer %s", key);
+        esp_http_client_set_header(client, "Authorization", auth);
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        if (esp_http_client_open(client, (int)jlen) != ESP_OK) {
+            ESP_LOGW(TAG, "TTS: connect failed");
+            break;
+        }
+        int w = esp_http_client_write(client, json, jlen);
+        if (w != (int)jlen) {
+            ESP_LOGW(TAG, "TTS: send failed (%d)", w);
+            esp_http_client_close(client);
+            break;
+        }
+        esp_http_client_fetch_headers(client);
+        int status = esp_http_client_get_status_code(client);
+        if (status != 200) {
+            char err[256];
+            int n = esp_http_client_read(client, err, sizeof(err) - 1);
+            if (n > 0) {
+                err[n] = '\0';
+                ESP_LOGW(TAG, "TTS: HTTP %d %s", status, err);
+            } else {
+                ESP_LOGW(TAG, "TTS: HTTP %d", status);
+            }
+            esp_http_client_close(client);
+            break;
+        }
+        uint8_t *buf = (uint8_t *)psram_alloc(MP3_BUF);
+        if (!buf) {
+            ESP_LOGW(TAG, "TTS: no memory");
+            esp_http_client_close(client);
+            break;
+        }
+        size_t got = 0;
+        for (;;) {
+            int n = esp_http_client_read(client, (char *)buf + got, (int)(MP3_BUF - got));
+            if (n <= 0) {
+                break;
+            }
+            got += (size_t)n;
+            if (got >= MP3_BUF) {
+                ESP_LOGW(TAG, "TTS: reply over %d bytes, truncated", MP3_BUF);
+                break;
+            }
+        }
+        esp_http_client_close(client);
+        if (!got) {
+            free(buf);
+            ESP_LOGW(TAG, "TTS: empty reply");
+            break;
+        }
+        mark(M_TTS);
+        *out = buf;
+        *out_len = got;
+        ok = true;
+        ESP_LOGI(TAG, "TTS: %u bytes", (unsigned)got);
+    } while (false);
+    esp_http_client_cleanup(client);
+    free(json);
+    return ok;
+}
+
 static void start_tts(void)
 {
     if (s_turn.tts_msg >= 0) {
@@ -1511,27 +1659,33 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
-        /*
-         * Replies are text, shown at reading pace: silence in place of speech
-         * paces the captions and ends the turn. To speak them instead, send
-         * the message's text (s_turn.texts + i * TEXT_MAX, if texts was
-         * allocated; up to TEXT_MAX - 1 bytes) to a TTS API of your choice and
-         * play the MP3 it returns. In place of the silence below: keep
-         * m.tts = TTS_ACTIVE and s_turn.tts_msg = i, set s_turn.silent = false,
-         * m.pcm_start = s_turn.pcm_out, m.pcm_frames = 0, s_turn.mp3_len = 0,
-         * s_turn.mp3_ended = false, s_turn.kbps = 0, s_turn.down_rate = 0 and
-         * mp3dec_init(&s_turn.dec). Then, on this task, pass the MP3 to
-         * tts_data() as it arrives (it buffers up to MP3_BUF and drops the
-         * rest, so hold off while it's full) and set s_turn.mp3_ended at the
-         * end. decode() plays it at the speaker's volume, captions following,
-         * and finishes the message once it's drained.
-         */
+        /* Speak the reply: fetch its MP3 (above) before showing the message,
+         * then play it exactly like a streamed one. Any fetch failure falls
+         * back to reading-pace silence, so the reply always finishes. */
+        char *text = s_turn.texts ? s_turn.texts + (size_t)i * TEXT_MAX : nullptr;
+        uint8_t *audio = nullptr;
+        size_t audio_len = 0;
+        bool speech = text && text[0] && step_tts_fetch(text, &audio, &audio_len);
+
         m.pcm_start = s_turn.pcm_out;
-        m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+        m.pcm_frames = 0;
         m.tts = TTS_ACTIVE;
         s_turn.tts_msg = i;
-        s_turn.silent = true;
-        ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
+        s_turn.silent = !speech;
+        s_turn.mp3_len = 0;
+        s_turn.mp3_ended = false;
+        s_turn.kbps = 0;
+        s_turn.down_rate = 0;
+        mp3dec_init(&s_turn.dec);
+        if (speech) {
+            tts_data(audio, audio_len);
+            s_turn.mp3_ended = true;
+            free(audio);
+            ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
+        } else {
+            m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
+            ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
+        }
         show_reply_start(m);
         return;
     }

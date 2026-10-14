@@ -25,6 +25,7 @@
 #include "esp_random.h"
 #include "host/ble_hs.h"
 #include "host/ble_store.h"
+#include "nvs.h"
 
 #include "muse_chat.h"
 #include "muse_link.h"
@@ -73,6 +74,20 @@ static void json_str(char *out, size_t len, const char *s)
     out[o] = '\0';
 }
 
+/* FIRMWARE_CONTRACT.md §1/§3: is a website-written value present in NVS?
+ * The key lives in main/'s "homehub" namespace; see the note in muse_input.c. */
+static bool nvs_value_set(const char *key)
+{
+    nvs_handle_t h;
+    if (nvs_open("homehub", NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    size_t len = 0;
+    esp_err_t err = nvs_get_str(h, key, NULL, &len);
+    nvs_close(h);
+    return err == ESP_OK && len > 1;   /* len includes the terminator */
+}
+
 static int build_status(char *out, size_t len)
 {
     muse_wifi_status_t w;
@@ -92,11 +107,14 @@ static int build_status(char *out, size_t len)
 
     return snprintf(out, len,
                     "{\"name\":\"%s\",\"fw\":\"%s\",\"battery\":%d,"
+                    "\"sdk_token\":%s,\"tts\":%s,"
                     "\"wifi\":{\"on\":%s,\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d},"
                     "\"hatch\":{\"host\":\"%s\",\"vm\":\"%s\",\"token\":%s,\"state\":\"%s\"},"
                     "\"link\":{\"paired\":%s,\"state\":\"%s\"},"
                     "\"volume\":%d,\"speaker\":%s,\"mic_gain\":%d,\"brightness\":%d,\"sleep\":%d,\"last\":\"%s\"}",
                     s_name, esp_app_get_description()->version, p.battery_pct,
+                    nvs_value_set("sdk_token") ? "true" : "false",
+                    nvs_value_set("tts_url") ? "true" : "false",
                     muse_settings_wifi_on() ? "true" : "false", wifi_state_name(w.state), ssid_e, w.ip, w.rssi,
                     host_e, vm_e, muse_settings_hatch_token_len() ? "true" : "false", muse_hatch_state_name(h.state),
                     muse_link_hatch_linked() ? "true" : "false", muse_link_state_name(muse_link_state()),
