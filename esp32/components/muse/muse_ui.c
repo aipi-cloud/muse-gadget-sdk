@@ -111,6 +111,7 @@ static lv_obj_t *s_mic_icon;
 static lv_obj_t *s_ptt_hint, *s_spk_hint, *s_pwr_hint;
 #if LV_USE_SNAPSHOT
 static volatile bool s_bench_demo;
+static volatile bool s_bench_face;   /* face page only: hide the pairing card */
 void muse_ui_bench_demo(bool enabled)
 {
     s_bench_demo = enabled;   /* display-only: never changes BLE identity/setup */
@@ -1364,6 +1365,11 @@ static void update_chrome(float now)
     if (muse_menu_is_open()) {
         card = CARD_NONE;
     }
+#if LV_USE_SNAPSHOT
+    if (s_bench_face) {
+        card = CARD_NONE;
+    }
+#endif
 
     if (card != s_pair_mode) {
         bool sub = false, code_vis = true, qr = false;
@@ -1632,6 +1638,9 @@ static volatile int s_bench_page = -1;
 void muse_ui_bench_page(bool settings)
 {
     s_bench_page = settings ? 1 : 0;   /* applied in the LVGL task */
+    if (!settings) {
+        s_bench_face = true;   /* display-only: never changes BLE identity/setup */
+    }
 }
 #endif
 

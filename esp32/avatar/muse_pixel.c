@@ -1,87 +1,120 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 /*
- * AIPI placeholder avatar (FIRMWARE_CONTRACT.md §5): an original geometric
- * pixel face - a rounded-square shell with a dark inner screen, block eyes
- * that blink, and a small mouth. It replaces Meta's Jollybot renderer, whose
- * Apache licence does not cover the character: nothing here derives from it.
- * Temporary art until AIPI's own character arrives; the renderer contract
- * (tools/muse/AVATAR_RECIPE.md, components/muse/muse_pixel.h) is unchanged:
- * a 64x64 indexed grid, blown up in nearest-neighbour blocks.
+ * Momo - the AIPI mascot.
+ *
+ * AIPI original character, not derived from Meta's Jollybot.
+ *
+ * Shape: a soft rice-cake / cloud blob, 35 px wide and 43 px tall on the 64x64
+ * grid, centred at x = 32 with its hem at y ~ 56.5. The bottom edge closes in
+ * three gentle scallops; there are no ears, horns, antennae or tail. Two round
+ * nub paws sit at its sides, and a single teal cowlick (the only brand colour)
+ * curls up from the crown and sways with the body.
+ *
+ * Colours: 1 px warm-brown ink outline #4A3428, cream body in three tones -
+ * #D9C4A3 shade, #F2E3C9 mid, #FFF8EC light - deep-brown bean eyes #3A2418
+ * with a white sparkle, coral blush #FF9E8A, a small dark mouth, and the teal
+ * cowlick #2FB8A6.
+ *
+ * Personality: a calm, slightly clumsy little mochi that likes being petted.
+ * It bobs when it breathes, leans in when it listens, taps its chin when it
+ * thinks, bounces when it talks and squints with joy when it is petted.
+ *
+ * Rendering is the AIPI contract (components/muse/muse_pixel.h): a 64x64
+ * indexed grid, integer/Q12 shading with a 4x4 Bayer dither, a part mask for
+ * the 1 px silhouette, and a host-side nearest-neighbour blow-up. No dynamic
+ * memory; every table is static and every per-pixel loop is pure integer.
  */
 
 #include "muse_pixel.h"
 
-#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define W MUSE_PX_W
 #define H MUSE_PX_H
 
+#define ONE 4096 /* Q12 unity */
+
 /* ---------------------------------------------------------------------------
- * Palette: fixed ink + per-mode shell and accent.
+ * Palette: 23 roles, index 0 is the black backdrop.
  * ------------------------------------------------------------------------- */
 
 enum {
-    C_BG = 0,      /* backdrop */
-    C_OUT,         /* shell outline */
-    C_BODY,        /* shell, per-mode */
-    C_BODY_D,      /* shell shade */
-    C_SCREEN,      /* inner face screen */
-    C_EYE,         /* eyes and mouth, per-mode accent */
-    C_EYE_HI,      /* eye highlight */
-    C_COUNT,
+    C_BG = 0,
+    C_OUT,      /* warm brown ink */
+    C_SHADOW,   /* floor contact shadow */
+    C_BODY_D,   /* cream, shade */
+    C_BODY_M,   /* cream, mid */
+    C_BODY_L,   /* cream, light */
+    C_EYE,      /* deep brown */
+    C_EYE_HI,   /* white sparkle */
+    C_BLUSH,
+    C_BLUSH_D,
+    C_MOUTH,
+    C_TONGUE,
+    C_TEAL,     /* cowlick */
+    C_TEAL_D,
+    C_GLOW0,    /* per-mode glow ramp (scheme) */
+    C_GLOW1,
+    C_GLOW2,
+    C_GLOW3,
+    C_ACCENT,   /* per-mode accent (scheme) */
+    C_SPARK,
+    C_HEART,
+    C_WHITE,
+    C_COUNT
 };
 
 typedef struct {
-    uint32_t shell;   /* 0xRRGGBB */
-    uint32_t acc;     /* accent: eyes, mouth, and the surrounding UI */
+    uint32_t glow[4]; /* bright to deep, used for the aura and rings */
+    uint32_t acc;     /* UI accent around the avatar */
 } scheme_t;
 
 static const scheme_t SCHEMES[MUSE_MODE_COUNT] = {
-    [MUSE_MODE_BOOT]      = { 0xdfe6ff, 0xa9c0ff },
-    [MUSE_MODE_IDLE]      = { 0xe9e4fb, 0xa77dff },
-    [MUSE_MODE_LISTENING] = { 0xdff2ff, 0x5cb8ff },
-    [MUSE_MODE_THINKING]  = { 0xf6e2ff, 0xe07bff },
-    [MUSE_MODE_SPEAKING]  = { 0xddffef, 0x6ff0bf },
-    [MUSE_MODE_ERROR]     = { 0xffe6e6, 0xff5c5c },
-    [MUSE_MODE_OFF]       = { 0x8f8ab0, 0x7c72d0 },
+    [MUSE_MODE_BOOT]      = { { 0xffffff, 0xcfe0ff, 0x8fa8ff, 0x5a5fe0 }, 0xa9c0ff },
+    [MUSE_MODE_IDLE]      = { { 0xf4e8ff, 0xc7a4ff, 0x9a6bff, 0x5b3fd9 }, 0xa77dff },
+    [MUSE_MODE_LISTENING] = { { 0xe8faff, 0x8fdcff, 0x3fa2ff, 0x2a5bd7 }, 0x5cb8ff },
+    [MUSE_MODE_THINKING]  = { { 0xffe6ff, 0xff9cf0, 0xd35bff, 0x7a2bd9 }, 0xe07bff },
+    [MUSE_MODE_SPEAKING]  = { { 0xeafff4, 0x9ff5cf, 0x3fd9a0, 0x1f9a7a }, 0x6ff0bf },
+    [MUSE_MODE_ERROR]     = { { 0xffd6d6, 0xff6b6b, 0xc7304a, 0x6b1a3a }, 0xff5c5c },
+    [MUSE_MODE_OFF]       = { { 0xd8d4ff, 0x8f86d9, 0x5a4fb0, 0x2e2870 }, 0x7c72d0 },
 };
 
-static const uint32_t FIXED[C_COUNT] = {
+static const uint32_t FIXED_HEX[C_COUNT] = {
     [C_BG] = 0x000000,
-    [C_OUT] = 0x14141f,
-    [C_BODY_D] = 0x000000,     /* derived from the shell in build_palette() */
-    [C_SCREEN] = 0x0d1017,
-    [C_EYE] = 0x000000,        /* accent, in build_palette() */
+    [C_OUT] = 0x4a3428,
+    [C_SHADOW] = 0x1c1310,
+    [C_BODY_D] = 0xd9c4a3,
+    [C_BODY_M] = 0xf2e3c9,
+    [C_BODY_L] = 0xfff8ec,
+    [C_EYE] = 0x3a2418,
     [C_EYE_HI] = 0xffffff,
+    [C_BLUSH] = 0xff9e8a,
+    [C_BLUSH_D] = 0xe07a70,
+    [C_MOUTH] = 0x4a2a20,
+    [C_TONGUE] = 0xe2696b,
+    [C_TEAL] = 0x2fb8a6,
+    [C_TEAL_D] = 0x1d8a7b,
+    [C_SPARK] = 0xfff6e2,
+    [C_HEART] = 0xff7e8c,
+    [C_WHITE] = 0xffffff,
 };
 
+static uint8_t s_rgb[C_COUNT][3];
 static uint16_t s_pal[C_COUNT];
 static uint16_t s_pal_dim[C_COUNT];
+static bool s_pal_init;
+
+static const uint8_t BAYER[4][4] = {
+    {  0,  8,  2, 10 },
+    { 12,  4, 14,  6 },
+    {  3, 11,  1,  9 },
+    { 15,  7, 13,  5 },
+};
 
 static uint8_t s_fb[W * H];
-
-uint32_t muse_pixel_accent(muse_mode_t mode)
-{
-    if ((unsigned)mode >= MUSE_MODE_COUNT) {
-        mode = MUSE_MODE_IDLE;
-    }
-    return SCHEMES[mode].acc;
-}
+static uint8_t s_mask[W * H]; /* 1 body, 2 paw, 3 cowlick */
 
 static uint16_t to565(uint32_t c)
 {
@@ -97,31 +130,101 @@ static uint16_t dim565(uint16_t c)
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
-static uint32_t scale_hex(uint32_t c, int permille)
+/*
+ * Per-mode palette. The character's own colours never change; the scheme
+ * colours (rim, glow ramp, accent) ease toward the new mode by 1-e^-7dt.
+ */
+static void palette_frame(muse_mode_t mode, float dt, int bright)
 {
-    uint32_t r = ((c >> 16) & 0xff) * permille / 1000;
-    uint32_t g = ((c >> 8) & 0xff) * permille / 1000;
-    uint32_t b = (c & 0xff) * permille / 1000;
-    return (r << 16) | (g << 8) | b;
-}
+    uint32_t tgt[C_COUNT];
+    memcpy(tgt, FIXED_HEX, sizeof(tgt));
 
-static void build_palette(muse_mode_t mode)
-{
     const scheme_t *s = &SCHEMES[mode];
-    uint32_t body[C_COUNT];
-    memcpy(body, FIXED, sizeof(body));
-    body[C_BODY] = s->shell;
-    body[C_BODY_D] = scale_hex(s->shell, 780);
-    body[C_EYE] = s->acc;
+    for (int i = 0; i < 4; i++) {
+        tgt[C_GLOW0 + i] = s->glow[i];
+    }
+    tgt[C_ACCENT] = s->acc;
+
+    int k = (int)(dt * 7.0f * 256.0f);
+    if (k > 256) k = 256;
+    if (k < 0) k = 0;
+
     for (int i = 0; i < C_COUNT; i++) {
-        s_pal[i] = to565(body[i]);
+        uint32_t a = tgt[i];
+        int r = (int)((a >> 16) & 0xff);
+        int g = (int)((a >> 8) & 0xff);
+        int b = (int)(a & 0xff);
+        if (!s_pal_init) {
+            s_rgb[i][0] = (uint8_t)r;
+            s_rgb[i][1] = (uint8_t)g;
+            s_rgb[i][2] = (uint8_t)b;
+        } else if (i >= C_GLOW0) {
+            s_rgb[i][0] = (uint8_t)(s_rgb[i][0] + (((r - s_rgb[i][0]) * k) >> 8));
+            s_rgb[i][1] = (uint8_t)(s_rgb[i][1] + (((g - s_rgb[i][1]) * k) >> 8));
+            s_rgb[i][2] = (uint8_t)(s_rgb[i][2] + (((b - s_rgb[i][2]) * k) >> 8));
+        }
+        int rr = s_rgb[i][0] * bright >> 8;
+        int gg = s_rgb[i][1] * bright >> 8;
+        int bb = s_rgb[i][2] * bright >> 8;
+        s_pal[i] = to565(((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bb);
         s_pal_dim[i] = dim565(s_pal[i]);
     }
+    s_pal_init = true;
+}
+
+uint32_t muse_pixel_accent(muse_mode_t mode)
+{
+    if ((unsigned)mode >= MUSE_MODE_COUNT) {
+        mode = MUSE_MODE_IDLE;
+    }
+    return SCHEMES[mode].acc;
 }
 
 /* ---------------------------------------------------------------------------
- * Drawing primitives (grid coordinates, clipped).
+ * Small integer tables and primitives.
  * ------------------------------------------------------------------------- */
+
+/* sin(2*pi*i/64) in Q15, with the wrap sample for linear interpolation. */
+static const int16_t SIN_Q15[65] = {
+         0,   3212,   6393,   9512,  12539,  15446,  18204,  20787,
+     23170,  25329,  27245,  28898,  30273,  31356,  32137,  32609,
+     32767,  32609,  32137,  31356,  30273,  28898,  27245,  25329,
+     23170,  20787,  18204,  15446,  12539,   9512,   6393,   3212,
+         0,  -3212,  -6393,  -9512, -12539, -15446, -18204, -20787,
+    -23170, -25329, -27245, -28898, -30273, -31356, -32137, -32609,
+    -32767, -32609, -32137, -31356, -30273, -28898, -27245, -25329,
+    -23170, -20787, -18204, -15446, -12539,  -9512,  -6393,  -3212,
+         0,
+};
+
+/* Half width of a filled disc of radius r at each row dy. */
+static const int8_t DISC_HALF[6][7] = {
+    { 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 0, 0, 0, 0, 0, 0 },
+    { 2, 1, 0, 0, 0, 0, 0 },
+    { 3, 2, 2, 0, 0, 0, 0 },
+    { 4, 3, 3, 2, 0, 0, 0 },
+    { 5, 4, 4, 4, 3, 0, 0 },
+};
+
+/* One turn of a sine at Q16 phase, result -32767..32767. */
+static int qsin16(int ph)
+{
+    ph &= 0xffff;
+    int i = ph >> 10;
+    int f = ph & 1023;
+    int a = SIN_Q15[i];
+    int b = SIN_Q15[i + 1];
+    return a + (((b - a) * f) >> 10);
+}
+
+/* Sine of `cycles` turns, scaled to `amp` pixels, rounded. */
+static int osc_px(float cycles, int amp)
+{
+    float whole = (float)(int)cycles;
+    int ph = (int)((cycles - whole) * 65536.0f) & 0xffff;
+    return (qsin16(ph) * amp) >> 15;
+}
 
 static void px(int x, int y, uint8_t c)
 {
@@ -130,180 +233,475 @@ static void px(int x, int y, uint8_t c)
     }
 }
 
-static void rect(int x0, int y0, int x1, int y1, uint8_t c)
+static void hline(int x0, int x1, int y, uint8_t c)
 {
-    if (y0 < 0) y0 = 0;
-    if (y1 >= H) y1 = H - 1;
-    for (int y = y0; y <= y1; y++) {
-        for (int x = x0; x <= x1; x++) {
+    if (y < 0 || y >= H) {
+        return;
+    }
+    if (x0 < 0) x0 = 0;
+    if (x1 >= W) x1 = W - 1;
+    for (int x = x0; x <= x1; x++) {
+        s_fb[y * W + x] = c;
+    }
+}
+
+static void mask_disc(int cx, int cy, int r, uint8_t id)
+{
+    if (r < 0 || r > 5) {
+        return;
+    }
+    for (int j = -r; j <= r; j++) {
+        int dy = j < 0 ? -j : j;
+        int half = DISC_HALF[r][dy];
+        int y = cy + j;
+        if (y < 0 || y >= H) {
+            continue;
+        }
+        for (int i = -half; i <= half; i++) {
+            int x = cx + i;
+            if (x >= 0 && x < W) {
+                s_mask[y * W + x] = id;
+            }
+        }
+    }
+}
+
+static void stamp(int x, int y, const uint8_t *rows, int n, uint8_t c)
+{
+    for (int j = 0; j < n; j++) {
+        uint8_t m = rows[j];
+        for (int i = 0; m; i++, m = (uint8_t)(m >> 1)) {
+            if (m & 1) {
+                px(x + i, y + j, c);
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * The body: one superellipse-ish blob with a scalloped hem, shaded from a
+ * fake surface normal with a Bayer dither, plus the mode's dithered aura.
+ * ------------------------------------------------------------------------- */
+
+#define BODY_CX 32
+#define BODY_CY 36
+#define BODY_RX 16
+#define BODY_RY 18
+#define BODY_FLOOR 54 /* ellipse bottom; the scallops hang 2 px below */
+
+static int s_hem[W]; /* extra pixels added under the ellipse, per column */
+static int s_lx[W];
+static int s_ly[H];
+static int s_u2[W]; /* (dx/rx)^2 in Q12, per column */
+
+static void build_hem(int cx)
+{
+    for (int x = 0; x < W; x++) {
+        int ax = x - cx;
+        if (ax < 0) ax = -ax;
+        if (ax >= 14) {
+            s_hem[x] = 0;
+            continue;
+        }
+        int ph = ((int)((x - cx) * (65536.0f / 10.0f)) + 16384) & 0xffff;
+        int w = 256 + ((qsin16(ph) * 460) >> 15); /* Q8 px, 0..2 */
+        if (w < 0) w = 0;
+        int taper = 14 - ax;
+        if (taper > 5) taper = 5;
+        s_hem[x] = (w * taper / 5) >> 8;
+    }
+}
+
+static void draw_body(int cx, int cy, int rx, int ry, int aura)
+{
+    build_hem(cx);
+
+    int kx = (ONE * ONE) / (rx * rx);
+    int ky = (ONE * ONE) / (ry * ry);
+
+    for (int x = 0; x < W; x++) {
+        int dx = x - cx;
+        s_lx[x] = (dx * ONE) / rx;
+        s_u2[x] = (dx * dx * kx) >> 12;
+    }
+    for (int y = 0; y < H; y++) {
+        s_ly[y] = ((y - cy) * ONE) / ry;
+    }
+
+    for (int y = 0; y < H; y++) {
+        int dy = y - cy;
+        int ly = s_ly[y];
+        uint8_t *row = &s_fb[y * W];
+        uint8_t *mrow = &s_mask[y * W];
+        int ymax = ry + 3;
+        if (dy < -ymax || dy > ymax + 2) {
+            continue;
+        }
+        for (int x = 0; x < W; x++) {
+            int dx = x - cx;
+            int adx = dx < 0 ? -dx : dx;
+            if (adx > rx + 8) {
+                continue;
+            }
+            int dye = dy > 0 ? dy - s_hem[x] : dy;
+            int u2 = s_u2[x];
+            int v2 = (dye * dye * ky) >> 12;
+            int f;
+            if (dy > 0) {
+                /* Flat, rice-cake underside (superellipse n=4) so the wavy
+                   hem runs along the floor instead of round a dome. */
+                f = ((u2 * u2) >> 12) + ((v2 * v2) >> 12);
+            } else {
+                /* Soft dome on top (n slightly above 2). */
+                f = u2 + v2 - ((u2 * v2 >> 12) * 3 >> 3);
+            }
+
+            if (f < ONE) {
+                /* Cream, lit from the top left, dithered between tones. */
+                int lx = s_lx[x];
+                int lit = -((lx * 2 + ly * 5) >> 2);
+                lit += (((x * 37 + y * 17) & 31) - 16) * 3;
+                int d = (BAYER[y & 3][x & 3] - 8) * 58;
+                int l = lit + d;
+
+                uint8_t c;
+                if (l > 520) {
+                    c = C_BODY_L;
+                } else if (l > -3900) {
+                    c = C_BODY_M;
+                } else {
+                    c = C_BODY_D;
+                }
+                row[x] = c;
+                mrow[x] = 1;
+            } else if (f < ONE + 1400 && aura > 0) {
+                int t = f - ONE;
+                uint8_t c;
+                int cov;
+                if (t < 260) {
+                    c = C_GLOW1;
+                    cov = 14;
+                } else if (t < 560) {
+                    c = C_GLOW2;
+                    cov = 9;
+                } else if (t < 900) {
+                    c = C_GLOW2;
+                    cov = 4;
+                } else {
+                    c = C_GLOW3;
+                    cov = 2;
+                }
+                cov = cov * aura >> 8;
+                if (BAYER[y & 3][x & 3] < cov) {
+                    row[x] = c;
+                }
+            }
+        }
+    }
+}
+
+/* 1 px ink around every part, drawn on background pixels only. */
+static void outline_pass(void)
+{
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (s_mask[y * W + x]) {
+                continue;
+            }
+            bool edge = false;
+            if (x > 0 && s_mask[y * W + x - 1]) edge = true;
+            if (x < W - 1 && s_mask[y * W + x + 1]) edge = true;
+            if (y > 0 && s_mask[(y - 1) * W + x]) edge = true;
+            if (y < H - 1 && s_mask[(y + 1) * W + x]) edge = true;
+            if (edge) {
+                s_fb[y * W + x] = C_OUT;
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Paws and cowlick.
+ * ------------------------------------------------------------------------- */
+
+static void draw_paw(int cx, int cy, int r)
+{
+    /*
+     * A seam ring: ink where the paw breaks the silhouette, a soft crease
+     * where it rests against the body, so it reads as attached.
+     */
+    int rr = r + 1;
+    /* Fully inside the body, a paw reads better as a soft crease than as a
+       stray ink ring (a monocle on the cheek, say). */
+    bool inside = true;
+    const int ox[4] = { 0, 0, -rr, rr };
+    const int oy[4] = { -rr, rr, 0, 0 };
+    for (int k = 0; k < 4; k++) {
+        int x = cx + ox[k];
+        int y = cy + oy[k];
+        if (x < 0 || x >= W || y < 0 || y >= H || s_mask[y * W + x] != 1) {
+            inside = false;
+        }
+    }
+    for (int j = -rr; j <= rr; j++) {
+        int dy = j < 0 ? -j : j;
+        int h_out = DISC_HALF[rr][dy];
+        int h_in = (dy <= r) ? DISC_HALF[r][dy] : -1;
+        for (int i = -h_out; i <= h_out; i++) {
+            if (h_in >= 0 && i >= -h_in && i <= h_in) {
+                continue;
+            }
+            int x = cx + i;
+            int y = cy + j;
+            if (x < 0 || x >= W || y < 0 || y >= H) {
+                continue;
+            }
+            px(x, y, inside ? C_BODY_D : C_OUT);
+        }
+    }
+    for (int j = -r; j <= r; j++) {
+        int dy = j < 0 ? -j : j;
+        int half = DISC_HALF[r][dy];
+        for (int i = -half; i <= half; i++) {
+            uint8_t c = C_BODY_M;
+            if (i + j < -1) {
+                c = C_BODY_L;
+            } else if (j == r || i + j > 2) {
+                c = C_BODY_D;
+            }
+            px(cx + i, cy + j, c);
+        }
+    }
+    mask_disc(cx, cy, r, 2);
+}
+
+/* A paw held in front of the face: drawn after the outline pass so the ink
+   ring survives on top of the body and reads as a separate limb. */
+static void draw_paw_front(int cx, int cy, int r)
+{
+    int rr = r + 1;
+    for (int j = -rr; j <= rr; j++) {
+        int dy = j < 0 ? -j : j;
+        int h_out = DISC_HALF[rr][dy];
+        int h_in = (dy <= r) ? DISC_HALF[r][dy] : -1;
+        for (int i = -h_out; i <= h_out; i++) {
+            if (h_in >= 0 && i >= -h_in && i <= h_in) {
+                continue;
+            }
+            px(cx + i, cy + j, C_OUT);
+        }
+    }
+    for (int j = -r; j <= r; j++) {
+        int dy = j < 0 ? -j : j;
+        int half = DISC_HALF[r][dy];
+        for (int i = -half; i <= half; i++) {
+            uint8_t c = C_BODY_M;
+            if (i + j < -1) {
+                c = C_BODY_L;
+            } else if (j == r || i + j > 2) {
+                c = C_BODY_D;
+            }
+            px(cx + i, cy + j, c);
+        }
+    }
+    mask_disc(cx, cy, r, 2);
+}
+
+/* A four-pixel teal cowlick that curls to the right; `sway` is in pixels. */
+static void draw_cowlick(int bx, int top, int sway)
+{
+    static const uint8_t L[8] = { 4, 3, 2, 2, 1, 1, 1, 1 };
+    static const uint8_t R[8] = { 5, 5, 4, 3, 2, 2, 2, 2 };
+
+    for (int j = 0; j < 8; j++) {
+        int sh = (sway * (7 - j)) / 7;
+        int y = top + j;
+        for (int i = L[j]; i <= R[j]; i++) {
+            int x = bx + i + sh;
+            if (x < 0 || x >= W || y < 0 || y >= H) {
+                continue;
+            }
+            uint8_t c = (i == R[j] && j < 5) ? C_TEAL_D : C_TEAL;
+            px(x, y, c);
+            s_mask[y * W + x] = 3;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Face: stamped eyes and mouths, 4-5 px wide, exaggerated for 64x64.
+ * ------------------------------------------------------------------------- */
+
+enum { EYE_BEAN, EYE_WIDE, EYE_HAPPY, EYE_CLOSED, EYE_X };
+enum { M_SMILE, M_GRIN, M_O, M_FLAT, M_WAVE, M_TALK };
+
+static void eye_bean(int x, int y, bool big, int gx, int gy)
+{
+    static const uint8_t SMALL[5] = { 6, 15, 15, 15, 6 };
+    static const uint8_t BIG[6] = { 14, 31, 31, 31, 31, 14 };
+    x += gx;
+    y += gy;
+    if (big) {
+        stamp(x, y, BIG, 6, C_EYE);
+        px(x + 1, y + 1, C_EYE_HI);
+        px(x + 2, y + 1, C_EYE_HI);
+    } else {
+        stamp(x, y, SMALL, 5, C_EYE);
+        px(x + 1, y + 1, C_EYE_HI);
+    }
+}
+
+static void eye_happy(int x, int y)
+{
+    hline(x + 1, x + 3, y, C_EYE);
+    px(x, y + 1, C_EYE);
+    px(x + 4, y + 1, C_EYE);
+    px(x, y + 2, C_EYE);
+    px(x + 4, y + 2, C_EYE);
+}
+
+static void eye_closed(int x, int y)
+{
+    px(x, y, C_EYE);
+    px(x + 4, y, C_EYE);
+    hline(x + 1, x + 3, y + 1, C_EYE);
+}
+
+static void eye_x(int x, int y)
+{
+    for (int i = 0; i < 5; i++) {
+        px(x + i, y + i, C_EYE);
+        px(x + 4 - i, y + i, C_EYE);
+    }
+    px(x + 2, y + 2, C_EYE);
+}
+
+static void draw_eye(int x, int y, int style, bool big, int gx, int gy)
+{
+    switch (style) {
+    case EYE_HAPPY:
+        eye_happy(x, y);
+        break;
+    case EYE_CLOSED:
+        eye_closed(x, y);
+        break;
+    case EYE_X:
+        eye_x(x, y);
+        break;
+    default:
+        eye_bean(x, y, big || style == EYE_WIDE, gx, gy);
+        break;
+    }
+}
+
+static void mouth_smile(int cx, int y)
+{
+    px(cx - 3, y, C_MOUTH);
+    px(cx + 3, y, C_MOUTH);
+    hline(cx - 2, cx + 2, y + 1, C_MOUTH);
+}
+
+static void mouth_grin(int cx, int y)
+{
+    hline(cx - 2, cx + 2, y, C_MOUTH);
+    hline(cx - 3, cx + 3, y + 1, C_MOUTH);
+    hline(cx - 3, cx + 3, y + 2, C_MOUTH);
+    hline(cx - 2, cx + 2, y + 3, C_MOUTH);
+    hline(cx - 1, cx + 1, y + 2, C_TONGUE);
+    px(cx - 3, y, C_MOUTH);
+    px(cx + 3, y, C_MOUTH);
+}
+
+static void mouth_o(int cx, int y)
+{
+    hline(cx - 1, cx + 1, y, C_MOUTH);
+    px(cx - 2, y + 1, C_MOUTH);
+    px(cx + 2, y + 1, C_MOUTH);
+    px(cx - 2, y + 2, C_MOUTH);
+    px(cx + 2, y + 2, C_MOUTH);
+    hline(cx - 1, cx + 1, y + 3, C_MOUTH);
+}
+
+static void mouth_wave(int cx, int y)
+{
+    px(cx - 2, y, C_MOUTH);
+    px(cx - 1, y - 1, C_MOUTH);
+    px(cx, y, C_MOUTH);
+    px(cx + 1, y - 1, C_MOUTH);
+    px(cx + 2, y, C_MOUTH);
+}
+
+static void mouth_talk(int cx, int ytop, int h)
+{
+    if (h < 1) h = 1;
+    if (h > 6) h = 6;
+    for (int j = 0; j < h; j++) {
+        int w = 2;
+        if ((j == 0 || j == h - 1) && h > 3) w = 1;
+        hline(cx - w, cx + w, ytop + j, C_MOUTH);
+    }
+    if (h >= 4) {
+        hline(cx - 1, cx + 1, ytop + h - 1, C_TONGUE);
+    }
+}
+
+static void blush_blob(int x, int y, int wide, uint8_t c)
+{
+    hline(x + 1, x + wide - 2, y, c);
+    hline(x, x + wide - 1, y + 1, c);
+    hline(x + 1, x + wide - 2, y + 2, C_BLUSH_D);
+}
+
+/* ---------------------------------------------------------------------------
+ * Effects: sparkles, rings, hearts.
+ * ------------------------------------------------------------------------- */
+
+static void sparkle(int x, int y, int size, uint8_t c, uint8_t core)
+{
+    px(x, y, core);
+    if (size <= 0) {
+        return;
+    }
+    hline(x - size, x + size, y, c);
+    for (int j = 1; j <= size; j++) {
+        if (x - size + 1 >= 0 && y > 0 && y < H) {
+            px(x, y - j, c);
+            px(x, y + j, c);
+        }
+    }
+}
+
+static void dotted_ring(int cx, int cy, int r, uint8_t c, int cov)
+{
+    int rr = r * 16;
+    int lo = (rr - 10) * (rr - 10);
+    int hi = (rr + 10) * (rr + 10);
+    for (int y = cy - r - 2; y <= cy + r + 2; y++) {
+        if (y < 0 || y >= H) continue;
+        for (int x = cx - r - 2; x <= cx + r + 2; x++) {
+            if (x < 0 || x >= W) continue;
+            int dx = (x - cx) * 16;
+            int dy = (y - cy) * 16;
+            int d = dx * dx + dy * dy;
+            if (d < lo || d > hi) continue;
+            if (((x + 2 * y) & 1) != 0) continue;
+            if (BAYER[y & 3][x & 3] >= cov) continue;
             px(x, y, c);
         }
     }
 }
 
-/* Filled rounded rectangle; rows of a corner follow a quarter circle. */
-static void rrect(int x0, int y0, int x1, int y1, int r, uint8_t c)
+static void heart(int x, int y, uint8_t c)
 {
-    if (r <= 0) {
-        rect(x0, y0, x1, y1, c);
-        return;
-    }
-    for (int y = y0; y <= y1; y++) {
-        int dy = y < y0 + r ? y0 + r - y : y > y1 - r ? y - (y1 - r) : 0;
-        int dx = 0;
-        if (dy > 0 && dy < r) {
-            dx = r - (int)sqrtf((float)(r * r - dy * dy));
-        }
-        rect(x0 + dx, y, x1 - dx, y, c);
-    }
-}
-
-/* Integer line (the X eyes). */
-static void line(int x0, int y0, int x1, int y1, uint8_t c)
-{
-    int dx = abs(x1 - x0), dy = abs(y1 - y0);
-    int n = dx > dy ? dx : dy;
-    if (n == 0) {
-        px(x0, y0, c);
-        return;
-    }
-    for (int i = 0; i <= n; i++) {
-        px(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n, c);
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * The face
- * ------------------------------------------------------------------------- */
-
-/* Eye boxes: 7 wide, 9 tall, centres at x 24 and 40, y 27 (before dy). */
-#define EYE_L_X 21
-#define EYE_R_X 37
-#define EYE_Y  23
-
-static void draw_eye_block(int x, int dy, int h)
-{
-    rect(x, EYE_Y + dy, x + 6, EYE_Y + dy + h - 1, C_EYE);
-    px(x + 1, EYE_Y + dy + 1, C_EYE_HI);
-}
-
-static void draw_eye_happy(int x, int dy)
-{
-    /* ^ : two strokes meeting above centre, 2 px thick. */
-    for (int i = 0; i < 4; i++) {
-        px(x + i, EYE_Y + dy + 6 - i, C_EYE);
-        px(x + i, EYE_Y + dy + 7 - i, C_EYE);
-        px(x + 6 - i, EYE_Y + dy + 6 - i, C_EYE);
-        px(x + 6 - i, EYE_Y + dy + 7 - i, C_EYE);
-    }
-}
-
-static void draw_eye_closed(int x, int dy)
-{
-    rect(x, EYE_Y + dy + 4, x + 6, EYE_Y + dy + 5, C_EYE);
-}
-
-static void draw_eye_x(int x, int dy)
-{
-    line(x, EYE_Y + dy, x + 6, EYE_Y + dy + 8, C_EYE);
-    line(x + 6, EYE_Y + dy, x, EYE_Y + dy + 8, C_EYE);
-}
-
-static void draw_mouth(int dy, muse_mode_t mode, float level, bool happy, bool talking)
-{
-    int cy = 38 + dy;
-    if (happy > 0.2f && mode != MUSE_MODE_ERROR) {
-        rrect(25, cy - 3, 38, cy + 2, 2, C_EYE);   /* wide open grin */
-        rect(27, cy - 3, 36, cy - 2, C_EYE_HI);    /* teeth */
-        return;
-    }
-    switch (mode) {
-    case MUSE_MODE_LISTENING:
-        rect(29, cy - 4, 34, cy + 2, C_EYE);       /* O */
-        rect(31, cy - 2, 32, cy, C_SCREEN);
-        break;
-    case MUSE_MODE_SPEAKING: {
-        int open = 1 + (int)(talking ? level * 4.0f + 0.9f : 1.0f);
-        rect(27, cy - 1, 36, cy - 1 + open, C_EYE);
-        break;
-    }
-    case MUSE_MODE_ERROR:
-    case MUSE_MODE_OFF:
-    case MUSE_MODE_THINKING:
-        rect(27, cy, 36, cy, C_EYE);               /* flat */
-        break;
-    default:
-        rect(26, cy, 37, cy, C_EYE);               /* smile */
-        px(25, cy - 1, C_EYE);
-        px(38, cy - 1, C_EYE);
-        break;
-    }
-}
-
-static void draw_face(int dy, muse_mode_t mode, float t, float level, float happy,
-                      bool eyes_closed, bool eyes_happy, bool eyes_x)
-{
-    /* Shell: outline pass, then body, then the inner screen. */
-    rrect(9, 11 + dy, 54, 52 + dy, 9, C_OUT);
-    rrect(11, 13 + dy, 52, 50 + dy, 7, C_BODY);
-    rrect(13, 15 + dy, 50, 48 + dy, 5, C_BODY_D);   /* bezel */
-    rrect(15, 17 + dy, 48, 46 + dy, 4, C_SCREEN);
-
-    /* Stand: a geometric foot under the shell. */
-    rect(25, 53 + dy, 38, 56 + dy, C_BODY_D);
-    rect(21, 57 + dy, 42, 59 + dy, C_OUT);
-    rect(23, 57 + dy, 40, 58 + dy, C_BODY_D);
-
-    /* Eyes. */
-    if (eyes_x) {
-        draw_eye_x(EYE_L_X, dy);
-        draw_eye_x(EYE_R_X, dy);
-    } else if (eyes_happy) {
-        draw_eye_happy(EYE_L_X, dy);
-        draw_eye_happy(EYE_R_X, dy);
-    } else if (eyes_closed) {
-        draw_eye_closed(EYE_L_X, dy);
-        draw_eye_closed(EYE_R_X, dy);
-    } else if (mode == MUSE_MODE_THINKING) {
-        rect(EYE_L_X, EYE_Y + dy + 3, EYE_L_X + 6, EYE_Y + dy + 7, C_EYE);
-        rect(EYE_R_X, EYE_Y + dy + 3, EYE_R_X + 6, EYE_Y + dy + 7, C_EYE);
-        px(EYE_L_X + 1, EYE_Y + dy + 4, C_EYE_HI);
-        px(EYE_R_X + 1, EYE_Y + dy + 4, C_EYE_HI);
-    } else {
-        int h = mode == MUSE_MODE_LISTENING ? 9 : 8;
-        draw_eye_block(EYE_L_X, dy, h);
-        draw_eye_block(EYE_R_X, dy, h);
-    }
-
-    draw_mouth(dy, mode, level, happy, true);
-
-    /* Thinking: three squares lifting away to the upper right. */
-    if (mode == MUSE_MODE_THINKING) {
-        int phase = (int)(t * 3.0f) % 3;
-        for (int i = 0; i < 3; i++) {
-            if ((i + phase) % 3 == 2) {
-                continue;   /* blink one out */
-            }
-            int x = 52 + i * 3, y = 12 + dy - i * 5;
-            rect(x, y, x + 1 + i / 2, y + 1 + i / 2, C_EYE);
-        }
-    }
-    /* Listening/speaking: two short sound ticks beside the shell. */
-    if ((mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_SPEAKING) &&
-        (int)(t * 4.0f) % 2 == 0) {
-        rect(4, 26 + dy, 6, 32 + dy, C_EYE);
-        rect(57, 26 + dy, 59, 32 + dy, C_EYE);
-    }
+    static const uint8_t P[5] = { 0x0a, 0x1f, 0x1f, 0x0e, 0x04 };
+    stamp(x, y, P, 5, c);
+    px(x + 1, y + 1, C_WHITE);
 }
 
 /* ---------------------------------------------------------------------------
  * Frame: screen pixel -> grid cell, and the blown-up draw.
  * ------------------------------------------------------------------------- */
 
-/*
- * Screen pixel -> grid cell, with 0x80 set on a cell's last screen pixel. When
- * cells are 3+ pixels, that edge is drawn dimmer so the pixel grid shows.
- */
 #define MAP_MAX 512
 static uint8_t s_map[MAP_MAX];
 static int s_size;
@@ -328,7 +726,7 @@ void muse_pixel_scale(uint16_t *dst, int stride_px, int x0, int x1, int y0, int 
     for (int y = y0; y <= y1; y++, dst += stride_px) {
         uint8_t m = s_map[y];
         if (prev && m == prev_m) {
-            memcpy(dst, prev, n * sizeof(uint16_t));
+            memcpy(dst, prev, (size_t)n * sizeof(uint16_t));
             continue;
         }
         const uint8_t *row = &s_fb[(m & 0x7f) * W];
@@ -349,18 +747,35 @@ void muse_pixel_scale(uint16_t *dst, int stride_px, int x0, int x1, int y0, int 
 }
 
 /* ---------------------------------------------------------------------------
- * Render
+ * Persistent animation state (cold-start safe: all zero / identity).
  * ------------------------------------------------------------------------- */
 
-static uint32_t s_rng = 0x9e3779b9u;
+static struct {
+    bool ready;
+    float last_t;
+    float next_blink;
+    float blink_end;
+    float blink_end2;
+    float next_gaze;
+    float gx;
+    float gy;
+    float gx_t;
+    float gy_t;
+    uint32_t rng;
+} st = { .next_blink = 1.6f, .blink_end2 = -100.0f, .next_gaze = 0.9f,
+         .rng = 0x9e3779b9u };
 
 static float frand(void)
 {
-    s_rng ^= s_rng << 13;
-    s_rng ^= s_rng >> 17;
-    s_rng ^= s_rng << 5;
-    return (float)(s_rng & 0xffff) / 65535.0f;
+    st.rng ^= st.rng << 13;
+    st.rng ^= st.rng >> 17;
+    st.rng ^= st.rng << 5;
+    return (float)(st.rng & 0xffff) / 65535.0f;
 }
+
+/* ---------------------------------------------------------------------------
+ * Render
+ * ------------------------------------------------------------------------- */
 
 void muse_pixel_render(const muse_pose_t *p)
 {
@@ -368,52 +783,407 @@ void muse_pixel_render(const muse_pose_t *p)
     if ((unsigned)mode >= MUSE_MODE_COUNT) {
         mode = MUSE_MODE_IDLE;
     }
+
     float t = p->t;
-    float level = p->level;
-    float happy = p->happy < 0.0f ? 0.0f : p->happy > 1.0f ? 1.0f : p->happy;
-
-    /* Blink: a 120 ms close every 2.5-5.5 s. */
-    static float next_blink = 2.0f, blink_end;
-    if (t >= next_blink) {
-        blink_end = t + 0.12f;
-        next_blink = t + 2.5f + frand() * 3.0f;
-    }
-
-    build_palette(mode);
-    memset(s_fb, C_BG, sizeof(s_fb));
-
-    /* Body motion: a small integer bob, per mode. */
-    int dy = 0;
-    switch (mode) {
-    case MUSE_MODE_LISTENING: dy = (int)lroundf(sinf(t * 3.0f) * 0.7f); break;
-    case MUSE_MODE_THINKING:  dy = (int)lroundf(sinf(t * 2.4f) * 0.8f); break;
-    case MUSE_MODE_SPEAKING:  dy = -(int)lroundf(level * 1.5f + sinf(t * 5.0f) * 0.4f); break;
-    case MUSE_MODE_ERROR:     dy = p->mode_t < 0.6f ? (int)(sinf(t * 30.0f) * 1.4f) : 0; break;
-    case MUSE_MODE_OFF:       dy = 2; break;
-    default:                  dy = (int)lroundf(sinf(t * 1.8f)); break;
-    }
-    if (happy > 0.1f && mode != MUSE_MODE_ERROR) {
-        dy -= (int)lroundf(fabsf(sinf(t * 9.0f)) * 3.0f * happy);
-    }
-    if (mode == MUSE_MODE_BOOT) {
-        float rise = p->mode_t < 0.6f ? 1.0f - p->mode_t / 0.6f : 0.0f;
-        dy += (int)(rise * 7.0f);
-    }
-
-    bool eyes_closed = false, eyes_happy = false, eyes_x = false;
-    if (mode == MUSE_MODE_BOOT) {
-        eyes_closed = p->mode_t < 0.9f;
-    } else if (mode == MUSE_MODE_OFF) {
-        eyes_closed = p->mode_t > 0.5f;
-    } else if (t < blink_end) {
-        eyes_closed = true;
-    }
-    if (happy > 0.2f && mode != MUSE_MODE_ERROR) {
-        eyes_happy = true;
-    }
+    float mt = p->mode_t < 0.0f ? 0.0f : p->mode_t;
+    float level = p->level < 0.0f ? 0.0f : (p->level > 1.0f ? 1.0f : p->level);
+    float happy = p->happy < 0.0f ? 0.0f : (p->happy > 1.0f ? 1.0f : p->happy);
     if (mode == MUSE_MODE_ERROR) {
-        eyes_x = true;
+        happy = 0.0f; /* the alert face never turns joyful */
     }
 
-    draw_face(dy, mode, t, level, happy, eyes_closed, eyes_happy, eyes_x);
+    float dt;
+    if (!st.ready) {
+        dt = 0.04f;
+        st.ready = true;
+    } else {
+        dt = t - st.last_t;
+        if (dt < 0.0f) dt = 0.0f;
+        if (dt > 0.2f) dt = 0.2f;
+    }
+    st.last_t = t;
+
+    /* ---- timers: blinks and gaze -------------------------------------- */
+    if (t >= st.next_blink) {
+        st.blink_end = t + 0.13f;
+        st.blink_end2 = frand() < 0.35f ? t + 0.31f : -100.0f;
+        st.next_blink = t + 2.2f + frand() * 3.0f;
+    }
+    bool blinking = t < st.blink_end || (t >= st.blink_end2 && t < st.blink_end2 + 0.13f);
+
+    if (t >= st.next_gaze) {
+        st.gx_t = frand() * 2.0f - 1.0f;
+        st.gy_t = frand() * 2.0f - 1.0f;
+        st.next_gaze = t + 1.2f + frand() * 2.4f;
+    }
+    float kg = dt * 14.0f;
+    if (kg > 1.0f) kg = 1.0f;
+    st.gx += (st.gx_t - st.gx) * kg;
+    st.gy += (st.gy_t - st.gy) * kg;
+    int gaze_x = (int)(st.gx + (st.gx >= 0.0f ? 0.5f : -0.5f));
+    int gaze_y = (int)(st.gy + (st.gy >= 0.0f ? 0.5f : -0.5f));
+    if (gaze_x > 1) gaze_x = 1;
+    if (gaze_x < -1) gaze_x = -1;
+    if (gaze_y > 1) gaze_y = 1;
+    if (gaze_y < -1) gaze_y = -1;
+
+    /* ---- palette ------------------------------------------------------ */
+    int bright = 256;
+    if (mode == MUSE_MODE_OFF) {
+        float fade = mt < 1.0f ? mt : 1.0f;
+        bright = (int)((1.0f - 0.10f * fade) * 256.0f);
+    }
+    palette_frame(mode, dt, bright);
+
+    memset(s_fb, C_BG, sizeof(s_fb));
+    memset(s_mask, 0, sizeof(s_mask));
+
+    /* ---- rig: squash, breathe, bob ------------------------------------ */
+    int sy = 1000;
+    int sx = 1000;
+    if (mode == MUSE_MODE_BOOT && mt < 0.62f) {
+        int u = (int)(mt * 1000.0f / 0.62f);
+        if (u < 720) {
+            sy = 600 + 520 * u / 720;
+        } else {
+            sy = 1120 - 120 * (u - 720) / 280;
+        }
+        sx = 2000 - sy;
+        if (sx > 1440) sx = 1440;
+        if (sx < 880) sx = 880;
+    }
+    int breathe = 1000 + ((qsin16((int)(t * 900.0f * 65536.0f / 1000.0f)) * 28) >> 15);
+    sy = sy * breathe / 1000;
+    sx = sx * breathe / 1000;
+
+    int rx = BODY_RX * sx / 1000;
+    int ry = BODY_RY * sy / 1000;
+    if (rx < 10) rx = 10;
+    if (ry < 9) ry = 9;
+
+    int cx = BODY_CX;
+    int cy = BODY_FLOOR - ry;
+
+    int hop = 0;
+    if (happy > 0.15f) {
+        int h = (qsin16((int)(t * 2.2f * 65536.0f)) * 3) >> 15;
+        hop = (h < 0 ? -h : h) * (int)(happy * 1000.0f) / 1000;
+    }
+
+    if (mode == MUSE_MODE_LISTENING) {
+        int dy = osc_px(t * 1.35f, 1);
+        cy -= dy < 0 ? -dy : dy;
+    } else if (mode == MUSE_MODE_THINKING) {
+        cx += osc_px(t * 0.5f, 1);
+        cy -= osc_px(t * 0.8f, 1);
+    } else if (mode == MUSE_MODE_SPEAKING) {
+        cy -= (int)(level * 2.0f + 0.4f);
+    } else if (mode == MUSE_MODE_IDLE) {
+        cy -= osc_px(t * 0.55f, 1) < 0 ? -osc_px(t * 0.55f, 1) : osc_px(t * 0.55f, 1);
+    } else if (mode == MUSE_MODE_ERROR && mt < 0.6f) {
+        cx += osc_px(t * 6.0f, 2);
+    } else if (mode == MUSE_MODE_OFF) {
+        cy += 1;
+    }
+    cy -= hop;
+
+    /* ---- expression --------------------------------------------------- */
+    int eye_style = EYE_BEAN;
+    int mouth = M_SMILE;
+    bool big_eyes = false;
+    bool brows = false;
+    bool angry_brows = false;
+    int blush_w = 4;
+    int mouth_open = 0;
+    int gx = gaze_x;
+    int gy = gaze_y;
+
+    switch (mode) {
+    case MUSE_MODE_BOOT:
+        eye_style = mt < 0.9f ? EYE_CLOSED : EYE_BEAN;
+        mouth = M_SMILE;
+        break;
+    case MUSE_MODE_LISTENING:
+        eye_style = EYE_WIDE;
+        big_eyes = true;
+        mouth = M_O;
+        brows = true;
+        gx = 0;
+        gy = 0;
+        break;
+    case MUSE_MODE_THINKING:
+        mouth = M_WAVE;
+        gx = 1;
+        gy = -1;
+        if (((int)(t * 0.7f)) & 1) {
+            gx = -1;
+        }
+        break;
+    case MUSE_MODE_SPEAKING:
+        mouth = M_TALK;
+        mouth_open = 1 + (int)(level * 5.0f + 0.7f);
+        blush_w = 5;
+        break;
+    case MUSE_MODE_ERROR:
+        eye_style = EYE_X;
+        mouth = M_FLAT;
+        angry_brows = true;
+        gx = 0;
+        gy = 0;
+        break;
+    case MUSE_MODE_OFF:
+        eye_style = mt > 0.55f ? EYE_CLOSED : EYE_BEAN;
+        mouth = mt > 0.55f ? M_FLAT : M_SMILE;
+        gx = 0;
+        gy = 0;
+        break;
+    default:
+        if (blinking) {
+            eye_style = EYE_CLOSED;
+        }
+        break;
+    }
+
+    if (happy > 0.12f) {
+        eye_style = EYE_HAPPY;
+        mouth = M_GRIN;
+        blush_w = 5;
+        gx = 0;
+        gy = 0;
+    }
+    if (happy <= 0.12f && mode != MUSE_MODE_BOOT && mode != MUSE_MODE_LISTENING &&
+        mode != MUSE_MODE_ERROR && mode != MUSE_MODE_OFF && blinking) {
+        eye_style = EYE_CLOSED;
+    }
+
+    int face_cy = cy + (32 - BODY_CY) * sy / 1000;
+    int mouth_cy = cy + (40 - BODY_CY) * sy / 1000;
+    int blush_cy = cy + (37 - BODY_CY) * sy / 1000;
+    int eye_dx = 7 * sx / 1000;
+
+    /* ---- shadow, back sparkles, rings --------------------------------- */
+    int sh_rx = 11 * sx / 1000;
+    for (int y = 53; y <= 59; y++) {
+        for (int x = cx - sh_rx - 3; x <= cx + sh_rx + 3; x++) {
+            int dx = x - cx;
+            int dy = y - 56;
+            int f = (dx * dx * ONE) / (sh_rx * sh_rx) + (dy * dy * ONE) / 9;
+            if (f < 2600 || (f < ONE && BAYER[y & 3][x & 3] < 9)) {
+                px(x, y, C_SHADOW);
+            }
+        }
+    }
+
+    if (mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_SPEAKING) {
+        int per = 1500; /* ms per ring */
+        int ph = (int)(mt * 1000.0f) % per;
+        for (int k = 0; k < 2; k++) {
+            int r = 18 + (ph + k * per / 2) * 13 / per;
+            int fade = 10 - (r - 18) * 10 / 14;
+            if (fade < 2) fade = 2;
+            dotted_ring(cx, cy + 1, r, C_ACCENT, fade);
+        }
+        if (level > 0.05f) {
+            int len = 1 + (int)(level * 4.0f);
+            for (int k = 0; k < 3; k++) {
+                int l = len - k;
+                if (l < 1) l = 1;
+                int y = cy - 3 + k * 3;
+                hline(cx - 13 - k * 2 - l, cx - 13 - k * 2, y, C_ACCENT);
+                hline(cx + 13 + k * 2, cx + 13 + k * 2 + l, y, C_ACCENT);
+            }
+        }
+    }
+
+    /* Three sparkles orbiting: two behind the body. */
+    int spark_on = mode == MUSE_MODE_OFF ? 0 : 3;
+    if (mode == MUSE_MODE_BOOT) {
+        spark_on = 1 + (int)(mt / 0.18f);
+        if (spark_on > 3) spark_on = 3;
+    }
+    for (int k = 0; k < spark_on; k++) {
+        int ph = (int)((t * 0.11f + (float)k * 0.333f) * 65536.0f);
+        int sx_ = cx + (qsin16(ph) * 26 >> 15);
+        int sy_ = 33 + (qsin16(ph + 16384) * 21 >> 15);
+        int tw = (qsin16((int)(t * 2.1f * 65536.0f) + k * 20000) > 0) ? 1 : 0;
+        if (k < 2) {
+            sparkle(sx_, sy_, tw, C_GLOW1, C_SPARK);
+        }
+    }
+
+    /* ---- body --------------------------------------------------------- */
+    int aura = 200;
+    if (mode == MUSE_MODE_LISTENING) aura = 230 + (int)(level * 26.0f);
+    if (mode == MUSE_MODE_SPEAKING) aura = 235;
+    if (mode == MUSE_MODE_ERROR) aura = 256;
+    if (mode == MUSE_MODE_BOOT) aura = 256;
+    if (mode == MUSE_MODE_OFF) {
+        float fade = mt < 1.0f ? 1.0f - mt : 0.0f;
+        aura = (int)(fade * 150.0f);
+    }
+    if (happy > 0.12f) aura = 255;
+
+    draw_body(cx, cy, rx, ry, aura);
+
+    /* ---- paws --------------------------------------------------------- */
+    int paw_r = 2;
+    int paw_y = cy + 4;
+    int paw_x = rx - 1;
+    int plx = cx - paw_x, ply = paw_y;
+    int prx = cx + paw_x, pry = paw_y;
+
+    switch (mode) {
+    case MUSE_MODE_LISTENING:
+        ply = pry = cy - 3;
+        plx = cx - rx + 1;
+        prx = cx + rx - 1;
+        break;
+    case MUSE_MODE_THINKING:
+        /* paw held in front of the jaw, drawn on top of the body below */
+        prx = cx + 8;
+        pry = cy + 5;
+        break;
+    case MUSE_MODE_SPEAKING:
+        ply = cy + 4 - (int)(level * 5.0f);
+        pry = cy + 4 + (int)(level * 2.0f);
+        break;
+    case MUSE_MODE_ERROR:
+        ply = pry = cy + 7;
+        break;
+    case MUSE_MODE_OFF:
+        if (mt < 0.55f) {
+            prx = cx + rx - 1 + osc_px(mt * 1.6f, 2);
+            pry = cy - 5;
+        } else {
+            ply = pry = cy + 7;
+        }
+        break;
+    default:
+        if (happy > 0.12f) {
+            ply = pry = cy - 7 - (int)(happy * 2.0f);
+            plx = cx - rx + 2;
+            prx = cx + rx - 2;
+            int w = osc_px(t * 3.0f, 1);
+            plx += w;
+            prx -= w;
+        } else {
+            ply += osc_px(t * 0.8f, 1);
+            pry += osc_px(t * 0.8f + 0.5f, 1);
+        }
+        break;
+    }
+    if (mode == MUSE_MODE_BOOT) {
+        ply = pry = cy + 6;
+    }
+
+    draw_paw(plx, ply, paw_r);
+    if (!(mode == MUSE_MODE_OFF && mt >= 0.55f && mt < 0.56f) &&
+        mode != MUSE_MODE_THINKING) {
+        draw_paw(prx, pry, paw_r);
+    }
+
+    /* ---- cowlick ------------------------------------------------------ */
+    int sway = osc_px(t * 0.75f, 1);
+    if (mode == MUSE_MODE_SPEAKING) {
+        sway += level > 0.5f ? 1 : 0;
+    }
+    if (happy > 0.12f) {
+        sway += osc_px(t * 2.4f, 1);
+    }
+    int tuft_top = cy - ry - 6;
+    draw_cowlick(cx + 1, tuft_top, sway);
+
+    outline_pass();
+
+    if (mode == MUSE_MODE_THINKING && happy <= 0.12f) {
+        draw_paw_front(prx, pry, paw_r);
+    }
+
+    /* ---- face --------------------------------------------------------- */
+    int ey = face_cy - 2;
+    int exl = cx - eye_dx - 1;
+    int exr = cx + eye_dx - 1;
+
+    if (brows) {
+        hline(exl - 1, exl + 2, ey - 4, C_EYE);
+        hline(exr + 1, exr + 4, ey - 4, C_EYE);
+    }
+    if (angry_brows) {
+        hline(exl - 1, exl + 2, ey - 3, C_EYE);
+        hline(exr + 1, exr + 4, ey - 3, C_EYE);
+        px(exl - 1, ey - 4, C_EYE);
+        px(exr + 4, ey - 4, C_EYE);
+    }
+
+    draw_eye(exl, ey, eye_style, big_eyes, gx, gy);
+    draw_eye(exr, ey, eye_style, big_eyes, gx, gy);
+
+    blush_blob(cx - eye_dx - 4, blush_cy, blush_w, C_BLUSH);
+    blush_blob(cx + eye_dx - blush_w + 1, blush_cy, blush_w, C_BLUSH);
+
+    switch (mouth) {
+    case M_GRIN:
+        mouth_grin(cx, mouth_cy - 1);
+        break;
+    case M_O:
+        mouth_o(cx, mouth_cy - 2);
+        break;
+    case M_FLAT:
+        hline(cx - 2, cx + 2, mouth_cy, C_MOUTH);
+        break;
+    case M_WAVE:
+        mouth_wave(cx, mouth_cy);
+        break;
+    case M_TALK:
+        mouth_talk(cx, mouth_cy - mouth_open / 2, mouth_open);
+        break;
+    default:
+        mouth_smile(cx, mouth_cy - 1);
+        break;
+    }
+
+    /* ---- front sparkle, thoughts, alert, hearts ----------------------- */
+    for (int k = 2; k < spark_on; k++) {
+        int ph = (int)((t * 0.11f + 0.666f) * 65536.0f);
+        int sx_ = cx + (qsin16(ph) * 27 >> 15);
+        int sy_ = 33 + (qsin16(ph + 16384) * 22 >> 15);
+        int tw = (qsin16((int)(t * 2.6f * 65536.0f) + 30000) > 0) ? 1 : 0;
+        if (!s_mask[sy_ * W + sx_]) {
+            sparkle(sx_, sy_, tw, C_GLOW1, C_SPARK);
+        }
+    }
+
+    if (mode == MUSE_MODE_THINKING) {
+        int ph = (int)(t * 3.0f) % 3;
+        for (int i = 0; i < 3; i++) {
+            if ((i + ph) % 3 == 2) {
+                continue;
+            }
+            int x = cx + 12 + i * 3;
+            int y = cy - 15 - i * 4;
+            px(x, y, C_ACCENT);
+            px(x + 1, y, C_ACCENT);
+            px(x, y + 1, C_ACCENT);
+            px(x + 1, y + 1, C_ACCENT);
+        }
+    }
+
+    if (mode == MUSE_MODE_ERROR) {
+        int x = cx + 16;
+        int y = cy - 13;
+        hline(x, x + 1, y, C_ACCENT);
+        hline(x, x + 1, y + 1, C_ACCENT);
+        hline(x, x + 1, y + 2, C_ACCENT);
+        hline(x, x + 1, y + 4, C_ACCENT);
+    }
+
+    if (happy > 0.12f && mode != MUSE_MODE_ERROR) {
+        int rise = (int)((1.0f - happy) * 5.0f);
+        int hx = cx - 13;
+        int hy = cy - 17 - rise + osc_px(t * 1.1f, 1);
+        if (happy > 0.3f) {
+            heart(hx, hy, C_HEART);
+            heart(hx + 21, hy - 3, C_HEART);
+        }
+    }
 }

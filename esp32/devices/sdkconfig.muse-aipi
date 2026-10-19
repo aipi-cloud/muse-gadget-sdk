@@ -73,3 +73,6 @@ CONFIG_GADGET_SDK_TOKEN=""
 
 # QR code on the Offline/Error screen (FIRMWARE_CONTRACT.md §4).
 CONFIG_LV_USE_QRCODE=y
+
+# AIPI replies are Chinese: captions and replies draw CJK from Unifont.
+CONFIG_MUSE_CJK_FONT=y
