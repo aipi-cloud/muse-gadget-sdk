@@ -142,6 +142,20 @@ menu "Muse"
         range 0 100
         default 70
 
+    # A reply is held whole before it is played, and bare PCM is six times the
+    # size of the same speech in MP3. A board with PSRAM to spare raises this;
+    # the default holds an MP3 reply of about a minute.
+    config MUSE_TTS_REPLY_BUF_KB
+        int "TTS reply buffer (KB)"
+        depends on MUSE_ENABLED
+        range 128 4096
+        default 512
+        help
+            How much room a TTS reply may take. A reply of raw PCM at 24 kHz
+            uses about 48 KB a second, so the default holds roughly ten
+            seconds of it. Raise it on a board with PSRAM to spare when the
+            speech service answers with PCM rather than MP3.
+
     config MUSE_WATCHER_CAMERA
         bool "SenseCAP Watcher camera capture and live preview"
         depends on MUSE_BOARD_SENSECAP_WATCHER && SPIRAM

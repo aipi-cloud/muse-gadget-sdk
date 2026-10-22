@@ -706,6 +706,44 @@ static void json_escape(char *out, size_t cap, const char *s)
     out[o] = '\0';
 }
 
+#if CONFIG_MUSE_HATCH
+/*
+ * The "@tts.test" error's short why, from what the probe reported: an HTTP
+ * error carries its status, a busy/offline/unconfigured/empty request says so
+ * in the detail, and anything else (e.g. "ogg") is a format the speaker can't
+ * play.
+ */
+static const char *tts_why(const char *detail, int status)
+{
+    /* A key or a body the device could not fit: the settings are the problem,
+     * not the network. */
+    if (!strcmp(detail, "key too long") || !strcmp(detail, "request too long")) {
+        return "unconfigured";
+    }
+    if (!strcmp(detail, "no memory")) {
+        return "memory";
+    }
+    /* The request never left the device, so the detail names the reason. */
+    if (status == 0) {
+        static const char *const local[] = { "offline", "unconfigured", "connect",
+                                             "empty", "busy", "memory" };
+        for (size_t i = 0; i < sizeof(local) / sizeof(local[0]); i++) {
+            if (!strcmp(detail, local[i])) {
+                return local[i];
+            }
+        }
+        return "connect";   /* never reached the service ("send", "init") */
+    }
+    if (status != 200) {
+        return "http";
+    }
+    if (!strcmp(detail, "empty")) {
+        return "empty";
+    }
+    return "format";
+}
+#endif
+
 /* The website's setup commands; false leaves the line to muse_ble_command(). */
 static bool console_setup_command(char *line)
 {
@@ -736,22 +774,61 @@ static bool console_setup_command(char *line)
         return true;
     }
     if (!strcmp(line, "tts?")) {
-        char url[256], model[64], voice[64];
-        char url_e[512], model_e[128], voice_e[128];
+        char url[256], model[64], voice[64], api[16];
+        char url_e[512], model_e[128], voice_e[128], api_e[32];
         cfg_get("tts_url", url, sizeof(url));
         cfg_get("tts_model", model, sizeof(model));
         cfg_get("tts_voice", voice, sizeof(voice));
+        cfg_get("tts_api", api, sizeof(api));
         json_escape(url_e, sizeof(url_e), url);
         json_escape(model_e, sizeof(model_e), model);
         json_escape(voice_e, sizeof(voice_e), voice);
+        json_escape(api_e, sizeof(api_e), api);
+#if CONFIG_MUSE_HATCH
+        char last[192];
+        muse_tts_last_json(last, sizeof(last));
+        const char *last_json = last;
+#else
+        const char *last_json = "null";
+#endif
         /* The key is never echoed (FIRMWARE_CONTRACT.md §3). */
-        printf("@tts {\"set\":%s,\"url\":\"%s\",\"model\":\"%s\",\"voice\":\"%s\"}\n",
-               url[0] ? "true" : "false", url_e, model_e, voice_e);
+        printf("@tts {\"set\":%s,\"url\":\"%s\",\"model\":\"%s\",\"voice\":\"%s\",\"api\":\"%s\",\"last\":%s}\n",
+               url[0] ? "true" : "false", url_e, model_e, voice_e, api_e, last_json);
+        fflush(stdout);
+        return true;
+    }
+    if (!strcmp(line, "tts.test")) {
+        /* A real request with a fixed short phrase; nothing is played. The
+         * probe's HTTP timeout bounds it at 20 s. */
+#if CONFIG_MUSE_HATCH
+        char detail[121];
+        char detail_e[256];
+        const char *format = "";
+        int status = 0, ms = 0;
+        size_t bytes = 0;
+        bool ok = muse_tts_probe(&status, &bytes, &format, &ms, detail, sizeof(detail));
+        json_escape(detail_e, sizeof(detail_e), detail);
+        if (ok) {
+            printf("@tts.test ok {\"ms\":%d,\"bytes\":%u,\"format\":\"%s\"}\n",
+                   ms, (unsigned)bytes, format);
+        } else {
+            printf("@tts.test error {\"why\":\"%s\",\"status\":%d,\"format\":\"%s\",\"detail\":\"%s\"}\n",
+                   tts_why(detail, status), status, format, detail_e);
+        }
+        /* How much of the console task's stack the voice test left: the number
+         * that says whether the stack this task was given is enough. */
+        ESP_LOGI(TAG, "voice test done, stack left %u bytes",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
+#else
+        /* The talks-to-Muse session isn't built on this board. */
+        printf("@tts.test error {\"why\":\"unconfigured\",\"status\":0,\"format\":\"\","
+               "\"detail\":\"no tts on this board\"}\n");
+#endif
         fflush(stdout);
         return true;
     }
     if (!strcmp(line, "tts.clear")) {
-        static const char *const keys[] = { "tts_url", "tts_key", "tts_model", "tts_voice" };
+        static const char *const keys[] = { "tts_url", "tts_key", "tts_model", "tts_voice", "tts_api" };
         bool ok = true;
         for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
             if (!cfg_erase(keys[i])) {
@@ -767,6 +844,7 @@ static bool console_setup_command(char *line)
         const char *key;
         const char *name;
         size_t max;
+        bool is_api = false;
         if (!strncmp(line, "tts.url=", 8)) {
             name = "url"; key = "tts_url"; max = 255; v = line + 8;
         } else if (!strncmp(line, "tts.key=", 8)) {
@@ -775,10 +853,16 @@ static bool console_setup_command(char *line)
             name = "model"; key = "tts_model"; max = 63; v = line + 10;
         } else if (!strncmp(line, "tts.voice=", 10)) {
             name = "voice"; key = "tts_voice"; max = 63; v = line + 10;
+        } else if (!strncmp(line, "tts.api=", 8)) {
+            /* The service's shape: "openai" (the OpenAI-compatible audio/speech
+             * one) or "gemini" (Google's generateContent one). */
+            name = "api"; key = "tts_api"; max = 15; v = line + 8; is_api = true;
         } else {
             return false;
         }
         if (strlen(v) > max) {
+            printf("@tts.%s error invalid\n", name);
+        } else if (is_api && strcmp(v, "openai") && strcmp(v, "gemini")) {
             printf("@tts.%s error invalid\n", name);
         } else if (!cfg_set(key, v)) {
             printf("@tts.%s error storage\n", name);
@@ -928,8 +1012,13 @@ esp_err_t muse_input_start(QueueHandle_t queue)
     if (xTaskCreate(input_task, "muse_input", 4096, NULL, 6, &s_input) != pdPASS) {
         return ESP_FAIL;
     }
-    /* Bench-test and setup console; the input still works if it can't start. */
-    xTaskCreate(serial_task, "muse_serial", 3584, NULL, 5, NULL);
+    /* Bench-test and setup console; the input still works if it can't start.
+     * The console runs the voice test, which reaches a stack of about 2.4 kB
+     * through the console, the probe and the request, and the request then
+     * opens a TLS connection on top of that. The stack stays in internal RAM
+     * on purpose: this task writes to NVS, and PSRAM cannot be reached while
+     * the flash is being written. */
+    xTaskCreate(serial_task, "muse_serial", 8192, NULL, 5, NULL);
     return ESP_OK;
 }
 

@@ -68,8 +68,10 @@ extern "C" {
 #include "cJSON.h"
 #include "minimp3.h"
 #include "muse_account_api.h"
+#include "muse_audio_format.h"
 #include "muse_link.h"
 #include "muse_settings.h"
+#include "muse_tts_protocol.h"
 #include "muse_wifi.h"
 #include "nvs.h"
 }
@@ -94,8 +96,21 @@ static const char *TAG = "muse_chat_session";
 #define NDJSON_LINE_MAX (16 * 1024)               /* one NDJSON line / the chat ack */
 #define SUB_LINE_MAX (256 * 1024)          /* an event line grows its buffer up to this */
 #define CHAT_PART (16 * 1024)              /* one body chunk of a long typed message */
-#define MP3_BUF (512 * 1024)
+/*
+ * The reply buffer. A reply is held whole before it is played, and bare PCM
+ * is six times the size of the same speech in MP3, so a board with PSRAM to
+ * spare raises this (CONFIG_MUSE_TTS_REPLY_BUF_KB). The turn's buffer is
+ * resident; a probe's is not.
+ */
+#ifdef CONFIG_MUSE_TTS_REPLY_BUF_KB
+#define REPLY_BUF_KB CONFIG_MUSE_TTS_REPLY_BUF_KB
+#else
+#define REPLY_BUF_KB 512
+#endif
+#define TURN_AUDIO_BUF (REPLY_BUF_KB * 1024)   /* the turn's own reply buffer */
+#define TTS_PROBE_BUF (256 * 1024)             /* ">tts.test" asks for one word */
 #define MP3_HOLD (1441 + 4)               /* the largest MP3 frame and the next header */
+#define TTS_PCM_CHUNK_SAMPLES 1152        /* raw replies: 16-bit samples folded per pass */
 #define MP3_POLL_ROOM (SCRATCH + 8192)     /* stop reading the socket below this much MP3 room */
 #define IN_BYTES (MIC_RATE * 2 * 8)        /* 8 s of mic backlog while connecting */
 #define OUT_BYTES (MIC_RATE * 2 * 2)       /* 2 s of decoded reply */
@@ -239,13 +254,19 @@ struct turn_t {
     /* TTS */
     int tts_msg;             /* message being fetched (or shown, speaker off), or -1 */
     bool silent;             /* speaker off: tts_msg is paced by silence, not fetched */
-    uint8_t *mp3;            /* MP3_BUF */
+    uint8_t *mp3;            /* TURN_AUDIO_BUF */
     size_t mp3_len;
     bool mp3_ended;
     mp3dec_t dec;
     resampler_t down;
     int kbps;
     int down_rate;
+    /* TTS reply format, from muse_audio_probe: MP3 keeps the decoder path,
+     * WAV/PCM16 are folded and resampled straight from mp3[]. */
+    muse_audio_kind_t src_kind;
+    uint32_t src_rate;
+    uint8_t src_channels;
+    size_t src_pos;          /* raw formats: bytes of mp3[] already played */
 };
 
 /* 10 KB, most of it the MP3 decoder: in PSRAM on boards that let static data go
@@ -1526,6 +1547,94 @@ static void tts_data(const uint8_t *data, size_t len);
 #define STEP_TTS_VOICE ""
 #define STEP_TTS_TIMEOUT_MS 20000
 
+/* Last request's outcome, for ">tts?" and ">tts.test"; false/zero until one runs. */
+static portMUX_TYPE s_tts_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_tts_last_ok;
+static int32_t s_tts_last_ms;
+static uint32_t s_tts_last_bytes;
+static char s_tts_last_format[8];
+static char s_tts_last_why[24];
+
+/* One request at a time: a voice turn's fetch and a console probe would each
+ * want a 512 KB reply buffer. The probe backs off ("busy"); a turn never does. */
+static std::atomic<bool> s_tts_inflight{false};
+
+struct tts_fail_t {
+    const char *why;         /* "offline", "unconfigured", "connect", "http",
+                                "empty", "format", "busy" */
+    int status;              /* last HTTP status; 0 when none was received */
+    char detail[128];        /* an HTTP error's body, or the reason to show */
+};
+
+/* The reply's Content-Type, captured as esp_http_client parses the headers.
+ * This IDF only exposes response headers when they are saved (Kconfig), so an
+ * event handler is the way to read just this one. */
+struct tts_reply_t {
+    char content_type[128];
+};
+
+static bool ci_equal(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char ca = *a++, cb = *b++;
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (char)(ca - 'A' + 'a');
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (char)(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return false;
+        }
+    }
+    return !*a && !*b;
+}
+
+static esp_err_t tts_on_http_event(esp_http_client_event_t *ev)
+{
+    auto *reply = static_cast<tts_reply_t *>(ev->user_data);
+    if (reply && ev->event_id == HTTP_EVENT_ON_HEADER && ev->header_key && ev->header_value &&
+        ci_equal(ev->header_key, "Content-Type")) {
+        strlcpy(reply->content_type, ev->header_value, sizeof(reply->content_type));
+    }
+    return ESP_OK;
+}
+
+static const char *tts_format_name(muse_audio_kind_t kind)
+{
+    switch (kind) {
+    case MUSE_AUDIO_MP3:
+        return "mp3";
+    case MUSE_AUDIO_WAV_PCM16:
+        return "wav";
+    case MUSE_AUDIO_PCM16:
+        return "pcm";
+    default:
+        return "";
+    }
+}
+
+/* What to remember as the failure reason: the probe's reason for a format we
+ * can't play ("ogg", "wav-codec"), the short why otherwise. */
+static const char *tts_reason(const tts_fail_t *fail)
+{
+    if (fail->why && !strcmp(fail->why, "format") && fail->detail[0]) {
+        return fail->detail;
+    }
+    return fail->why ? fail->why : "";
+}
+
+static void record_tts(bool ok, int ms, size_t bytes, const char *format, const char *why)
+{
+    portENTER_CRITICAL(&s_tts_mux);
+    s_tts_last_ok = ok;
+    s_tts_last_ms = ms;
+    s_tts_last_bytes = (uint32_t)bytes;
+    strlcpy(s_tts_last_format, format ? format : "", sizeof(s_tts_last_format));
+    strlcpy(s_tts_last_why, why ? why : "", sizeof(s_tts_last_why));
+    portEXIT_CRITICAL(&s_tts_mux);
+}
+
 /* NVS value first, compiled-in macro second (FIRMWARE_CONTRACT.md §3). The
  * keys live in main/'s "homehub" namespace; see the note in muse_input.c. */
 static void step_tts_field(const char *key, const char *fallback, char *out, size_t cap)
@@ -1544,109 +1653,366 @@ static void step_tts_field(const char *key, const char *fallback, char *out, siz
     }
 }
 
-static bool step_tts_fetch(const char *text, uint8_t **out, size_t *out_len)
+/*
+ * The request's working set: the URL, the key, the model and voice, the auth
+ * value and the body. It is a few kilobytes, more than the console task's
+ * stack can hold, so it lives in PSRAM for the length of the call.
+ */
+struct tts_work_t {
+    char url[256];
+    char key[256];
+    char model[64];
+    char voice[64];
+    char api_name[16];
+    char auth[264];   /* fits the 255-char key slot */
+    char body[2048];
+    char err[256];
+};
+
+/* A service that rejects a key often quotes it back. The key must not reach
+ * the device's log or the setup page, so it is cut out of the error text. */
+static void scrub_key(char *text, const char *key)
 {
-    *out = nullptr;
+    if (!text || !key || !key[0]) {
+        return;
+    }
+    size_t len = strlen(key);
+    char *p = text;
+    while ((p = strstr(p, key)) != nullptr) {
+        memset(p, '*', len);
+        p += len;
+    }
+}
+
+/*
+ * POSTs `text` to the configured TTS service and probes what came back. The
+ * reply lands in `dst` (the caller's buffer, `dst_cap` bytes) and *out_len
+ * says how much of it is audio; on failure *fail says why. The one request
+ * path both the turn's fetch and the console's ">tts.test" use, so the two
+ * can't drift apart.
+ *
+ * The service's shape is a setting ("tts_api"): the OpenAI-compatible
+ * audio/speech shape, or Google's generateContent shape. The first asks for
+ * mp3 and, when the service says it only speaks another format, asks again
+ * without saying.
+ */
+static bool tts_request(const char *text, uint8_t *dst, size_t dst_cap, size_t *out_len,
+                        muse_audio_info_t *info, tts_fail_t *fail, bool refuse_if_busy)
+{
+    if (!dst || !dst_cap || !out_len) {
+        fail->why = "unconfigured";
+        fail->status = 0;
+        fail->detail[0] = '\0';
+        return false;
+    }
     *out_len = 0;
-    if (!muse_wifi_connected()) {
+    *info = muse_audio_info_t{};
+    fail->why = "connect";
+    fail->status = 0;
+    fail->detail[0] = '\0';
+
+    bool owner = !s_tts_inflight.exchange(true);
+    if (!owner && refuse_if_busy) {
+        fail->why = "busy";
+        strlcpy(fail->detail, "busy", sizeof(fail->detail));
         return false;
     }
 
-    char url[256], key[256], model[64], voice[64];
-    step_tts_field("tts_url", STEP_TTS_URL, url, sizeof(url));
-    step_tts_field("tts_key", STEP_TTS_KEY, key, sizeof(key));
-    step_tts_field("tts_model", STEP_TTS_MODEL, model, sizeof(model));
-    step_tts_field("tts_voice", STEP_TTS_VOICE, voice, sizeof(voice));
-    if (!url[0]) {
-        return false;   /* nothing configured: the text-only fallback keeps the reply */
-    }
-
-    cJSON *body = cJSON_CreateObject();
-    cJSON_AddStringToObject(body, "model", model);
-    cJSON_AddStringToObject(body, "input", text);
-    cJSON_AddStringToObject(body, "response_format", "mp3");
-    cJSON_AddStringToObject(body, "voice", voice);
-    char *json = cJSON_PrintUnformatted(body);
-    cJSON_Delete(body);
-    if (!json) {
-        return false;
-    }
-    size_t jlen = strlen(json);
-
-    esp_http_client_config_t cfg = {};
-    cfg.url = url;
-    cfg.method = HTTP_METHOD_POST;
-    cfg.timeout_ms = STEP_TTS_TIMEOUT_MS;
-    cfg.buffer_size = 4096;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) {
-        free(json);
-        return false;
-    }
     bool ok = false;
+    uint8_t *buf = dst;
+    size_t cap = dst_cap;
+    esp_http_client_handle_t client = nullptr;
+    tts_work_t *ws = (tts_work_t *)psram_alloc(sizeof(tts_work_t));
+    if (!ws) {
+        fail->why = "unconfigured";
+        strlcpy(fail->detail, "no memory", sizeof(fail->detail));
+        /* The flag was taken above. Leaving it set would make every later
+         * request answer "busy" until the device is unplugged. */
+        if (owner) {
+            s_tts_inflight.store(false);
+        }
+        return false;
+    }
     do {
-        char auth[264];   /* fits the 255-char key slot */
-        snprintf(auth, sizeof(auth), "Bearer %s", key);
-        esp_http_client_set_header(client, "Authorization", auth);
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        if (esp_http_client_open(client, (int)jlen) != ESP_OK) {
-            ESP_LOGW(TAG, "TTS: connect failed");
+        if (!muse_wifi_connected()) {
+            fail->why = "offline";
+            strlcpy(fail->detail, "offline", sizeof(fail->detail));
             break;
         }
-        int w = esp_http_client_write(client, json, jlen);
-        if (w != (int)jlen) {
-            ESP_LOGW(TAG, "TTS: send failed (%d)", w);
-            esp_http_client_close(client);
+
+        step_tts_field("tts_url", STEP_TTS_URL, ws->url, sizeof(ws->url));
+        step_tts_field("tts_key", STEP_TTS_KEY, ws->key, sizeof(ws->key));
+        step_tts_field("tts_model", STEP_TTS_MODEL, ws->model, sizeof(ws->model));
+        step_tts_field("tts_voice", STEP_TTS_VOICE, ws->voice, sizeof(ws->voice));
+        step_tts_field("tts_api", "", ws->api_name, sizeof(ws->api_name));
+        if (!ws->url[0]) {
+            fail->why = "unconfigured";
+            strlcpy(fail->detail, "unconfigured", sizeof(fail->detail));
             break;
         }
-        esp_http_client_fetch_headers(client);
-        int status = esp_http_client_get_status_code(client);
-        if (status != 200) {
-            char err[256];
-            int n = esp_http_client_read(client, err, sizeof(err) - 1);
-            if (n > 0) {
-                err[n] = '\0';
-                ESP_LOGW(TAG, "TTS: HTTP %d %s", status, err);
-            } else {
-                ESP_LOGW(TAG, "TTS: HTTP %d", status);
-            }
-            esp_http_client_close(client);
+        muse_tts_api_t api = muse_tts_api_parse(ws->api_name);
+
+        if (!muse_tts_auth_value(api, ws->key, ws->auth, sizeof(ws->auth))) {
+            fail->why = "unconfigured";
+            strlcpy(fail->detail, "key too long", sizeof(fail->detail));
             break;
         }
-        uint8_t *buf = (uint8_t *)psram_alloc(MP3_BUF);
-        if (!buf) {
-            ESP_LOGW(TAG, "TTS: no memory");
-            esp_http_client_close(client);
-            break;
-        }
-        size_t got = 0;
-        for (;;) {
-            int n = esp_http_client_read(client, (char *)buf + got, (int)(MP3_BUF - got));
-            if (n <= 0) {
+        const char *auth_header = muse_tts_auth_header(api);
+
+        /* The reply outlives the loop: the client is closed after the loop body
+         * and its event handler still points at this struct. */
+        tts_reply_t reply = {};
+        for (int attempt = 0; attempt < 2; attempt++) {
+            reply = {};
+            /* mp3 first; a service that only speaks another format gets asked
+             * again without the field, and answers in its own format. */
+            const char *format = (api == MUSE_TTS_API_OPENAI && attempt == 0) ? "mp3" : nullptr;
+            if (!muse_tts_build_body(api, ws->model, ws->voice, text, format, ws->body,
+                                     sizeof(ws->body))) {
+                fail->why = "unconfigured";
+                strlcpy(fail->detail, "request too long", sizeof(fail->detail));
                 break;
             }
-            got += (size_t)n;
-            if (got >= MP3_BUF) {
-                ESP_LOGW(TAG, "TTS: reply over %d bytes, truncated", MP3_BUF);
+            size_t body_len = strlen(ws->body);
+
+            esp_http_client_config_t cfg = {};
+            cfg.url = ws->url;
+            cfg.method = HTTP_METHOD_POST;
+            cfg.timeout_ms = STEP_TTS_TIMEOUT_MS;
+            cfg.buffer_size = 4096;
+            cfg.crt_bundle_attach = esp_crt_bundle_attach;
+            cfg.event_handler = tts_on_http_event;
+            cfg.user_data = &reply;
+            client = esp_http_client_init(&cfg);
+            if (!client) {
+                strlcpy(fail->detail, "init", sizeof(fail->detail));
                 break;
             }
-        }
-        esp_http_client_close(client);
-        if (!got) {
-            free(buf);
-            ESP_LOGW(TAG, "TTS: empty reply");
+            esp_http_client_set_header(client, auth_header, ws->auth);
+            esp_http_client_set_header(client, "Content-Type", "application/json");
+            esp_http_client_set_header(client, "Accept", "audio/*");
+            if (esp_http_client_open(client, (int)body_len) != ESP_OK) {
+                ESP_LOGW(TAG, "TTS: connect failed");
+                strlcpy(fail->detail, "connect", sizeof(fail->detail));
+                break;
+            }
+            int sent = esp_http_client_write(client, ws->body, body_len);
+            if (sent != (int)body_len) {
+                ESP_LOGW(TAG, "TTS: send failed (%d)", sent);
+                strlcpy(fail->detail, "send", sizeof(fail->detail));
+                esp_http_client_close(client);
+                break;
+            }
+            esp_http_client_fetch_headers(client);
+            int status = esp_http_client_get_status_code(client);
+            fail->status = status;
+            if (status != 200) {
+                /* The whole body is read, not just the part that fits in the
+                 * detail: "response_format" often sits past the first 120
+                 * bytes, and that word is what asks for another try. */
+                int n = esp_http_client_read(client, ws->err, sizeof(ws->err) - 1);
+                if (n > 0) {
+                    ws->err[n] = '\0';
+                } else {
+                    snprintf(ws->err, sizeof(ws->err), "HTTP %d", status);
+                }
+                /* The service may quote the key back in its error; it must not
+                 * reach the device's log or the setup page. */
+                scrub_key(ws->err, ws->key);
+                esp_http_client_close(client);
+                esp_http_client_cleanup(client);
+                client = nullptr;
+                /* "response_format must be one of [wav]": the service speaks
+                 * another format, so ask again without naming one. */
+                if (attempt == 0 && api == MUSE_TTS_API_OPENAI &&
+                    (status == 400 || status == 415 || status == 422) &&
+                    strstr(ws->err, "response_format")) {
+                    ESP_LOGW(TAG, "TTS: service wants another format, asking again");
+                    continue;
+                }
+                fail->why = "http";
+                ESP_LOGW(TAG, "TTS: HTTP %d %s", status, ws->err);
+                strlcpy(fail->detail, ws->err, sizeof(fail->detail));
+                break;
+            }
+            /* The reply lands in the caller's buffer: one copy, not two. */
+            size_t got = 0;
+            for (;;) {
+                int n = esp_http_client_read(client, (char *)buf + got, (int)(cap - got));
+                if (n <= 0) {
+                    break;
+                }
+                got += (size_t)n;
+                if (got >= cap) {
+                    ESP_LOGW(TAG, "TTS: reply over %u bytes, truncated", (unsigned)cap);
+                    break;
+                }
+            }
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            client = nullptr;
+            if (!got) {
+                fail->why = "empty";
+                strlcpy(fail->detail, "empty", sizeof(fail->detail));
+                ESP_LOGW(TAG, "TTS: empty reply");
+                break;
+            }
+            /* Google's shape wraps the audio in JSON, base64 encoded. The
+             * unpacked audio replaces the JSON in the same buffer. */
+            const char *ctype = reply.content_type[0] ? reply.content_type : nullptr;
+            if (api == MUSE_TTS_API_GEMINI) {
+                muse_tts_reply_t unpacked;
+                if (!muse_tts_extract(api, buf, got, dst, dst_cap, &unpacked)) {
+                    fail->why = "format";
+                    strlcpy(fail->detail, unpacked.detail[0] ? unpacked.detail : "no-audio",
+                            sizeof(fail->detail));
+                    /* The service's own message may quote the key back. */
+                    scrub_key(fail->detail, ws->key);
+                    ESP_LOGW(TAG, "TTS: no audio in reply (%s)", fail->detail);
+                    break;
+                }
+                got = unpacked.bytes;
+                /* Google's own type says what the audio is; the HTTP type
+                 * only says the body was JSON. */
+                if (unpacked.mime[0]) {
+                    ctype = unpacked.mime;
+                }
+            }
+            /* Believe the bytes first, and the Content-Type only for bare PCM:
+             * an HTTP 200 carrying a JSON error must never be played. */
+            muse_audio_probe(buf, got, ctype, info);
+            if (info->kind == MUSE_AUDIO_UNSUPPORTED) {
+                fail->why = "format";
+                strlcpy(fail->detail, info->reason ? info->reason : "unknown", sizeof(fail->detail));
+                ESP_LOGW(TAG, "TTS: unsupported audio (%s)", info->reason ? info->reason : "unknown");
+                break;
+            }
+            *out_len = got;
+            ok = true;
             break;
         }
-        mark(M_TTS);
-        *out = buf;
-        *out_len = got;
-        ok = true;
-        ESP_LOGI(TAG, "TTS: %u bytes", (unsigned)got);
     } while (false);
-    esp_http_client_cleanup(client);
-    free(json);
+
+    if (client) {
+        esp_http_client_cleanup(client);
+    }
+    /* The key lives in this buffer: wipe it before it goes back to the heap. */
+    memset(ws->key, 0, sizeof(ws->key));
+    memset(ws->auth, 0, sizeof(ws->auth));
+    free(ws);
+    if (owner) {
+        s_tts_inflight.store(false);
+    }
     return ok;
+}
+
+static bool step_tts_fetch(const char *text, uint8_t *dst, size_t dst_cap,
+                            size_t *out_len, muse_audio_info_t *info)
+{
+    tts_fail_t fail;
+    int64_t t0 = now_us();
+    bool ok = tts_request(text, dst, dst_cap, out_len, info, &fail, false);
+    int ms = (int)((now_us() - t0) / 1000);
+    if (!ok) {
+        /* The reply still finishes at reading pace; this is why it has no voice. */
+        ESP_LOGW(TAG, "TTS: %s (%s)", tts_reason(&fail), fail.detail);
+        record_tts(false, ms, 0, "", tts_reason(&fail));
+        return false;
+    }
+    mark(M_TTS);
+    ESP_LOGI(TAG, "TTS: %u bytes, %s", (unsigned)*out_len, tts_format_name(info->kind));
+    record_tts(true, ms, *out_len, tts_format_name(info->kind), "");
+    return true;
+}
+
+/*
+ * Console ">tts.test": one real request with the saved settings, with a fixed
+ * short phrase, so the website can tell "saved" from "the service answers and
+ * its audio is playable". Nothing is played and no turn state is touched.
+ */
+extern "C" bool muse_tts_probe(int *status_out, size_t *bytes_out, const char **format_out,
+                               int *ms_out, char *detail, size_t detail_cap)
+{
+    if (status_out) {
+        *status_out = 0;
+    }
+    if (bytes_out) {
+        *bytes_out = 0;
+    }
+    if (format_out) {
+        *format_out = "";
+    }
+    if (ms_out) {
+        *ms_out = 0;
+    }
+    if (detail && detail_cap) {
+        detail[0] = '\0';
+    }
+
+    uint8_t *audio = (uint8_t *)psram_alloc(TTS_PROBE_BUF);
+    if (!audio) {
+        if (detail && detail_cap) {
+            strlcpy(detail, "no memory", detail_cap);
+        }
+        return false;
+    }
+    size_t len = 0;
+    muse_audio_info_t info;
+    tts_fail_t fail;
+    int64_t t0 = now_us();
+    bool ok = tts_request("Hi.", audio, TTS_PROBE_BUF, &len, &info, &fail, true);
+    int ms = (int)((now_us() - t0) / 1000);
+    free(audio);
+
+    if (status_out) {
+        *status_out = fail.status;
+    }
+    if (ms_out) {
+        *ms_out = ms;
+    }
+    if (ok) {
+        if (bytes_out) {
+            *bytes_out = len;
+        }
+        if (format_out) {
+            *format_out = tts_format_name(info.kind);
+        }
+        record_tts(true, ms, len, tts_format_name(info.kind), "");
+        ESP_LOGI(TAG, "TTS probe: %u bytes, %s, %d ms", (unsigned)len, tts_format_name(info.kind), ms);
+        return true;
+    }
+    /* An unplayable format reports the probe's reason as the format ("ogg"). */
+    if (format_out && info.reason) {
+        *format_out = info.reason;
+    }
+    if (detail && detail_cap) {
+        strlcpy(detail, fail.detail[0] ? fail.detail : tts_reason(&fail), detail_cap);
+    }
+    record_tts(false, ms, 0, "", tts_reason(&fail));
+    ESP_LOGW(TAG, "TTS probe: %s (%s), HTTP %d", tts_reason(&fail), fail.detail, fail.status);
+    return false;
+}
+
+/* The last request's outcome, as one JSON object for ">tts?"'s "last". */
+extern "C" void muse_tts_last_json(char *out, size_t cap)
+{
+    if (!out || !cap) {
+        return;
+    }
+    bool ok;
+    int32_t ms;
+    uint32_t bytes;
+    char format[sizeof(s_tts_last_format)];
+    char why[sizeof(s_tts_last_why)];
+    portENTER_CRITICAL(&s_tts_mux);
+    ok = s_tts_last_ok;
+    ms = s_tts_last_ms;
+    bytes = s_tts_last_bytes;
+    memcpy(format, s_tts_last_format, sizeof(format));
+    memcpy(why, s_tts_last_why, sizeof(why));
+    portEXIT_CRITICAL(&s_tts_mux);
+    snprintf(out, cap, "{\"ok\":%s,\"format\":\"%s\",\"bytes\":%u,\"ms\":%d,\"why\":\"%s\"}",
+             ok ? "true" : "false", format, (unsigned)bytes, (int)ms, why);
 }
 
 static void start_tts(void)
@@ -1659,28 +2025,39 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
-        /* Speak the reply: fetch its MP3 (above) before showing the message,
+        /* Speak the reply: fetch its audio (above) before showing the message,
          * then play it exactly like a streamed one. Any fetch failure falls
          * back to reading-pace silence, so the reply always finishes. */
         char *text = s_turn.texts ? s_turn.texts + (size_t)i * TEXT_MAX : nullptr;
-        uint8_t *audio = nullptr;
-        size_t audio_len = 0;
-        bool speech = text && text[0] && step_tts_fetch(text, &audio, &audio_len);
+        /* The turn's own buffer takes the reply: one copy, not two. */
+        s_turn.mp3_len = 0;
+        s_turn.mp3_ended = false;
+        s_turn.kbps = 0;
+        s_turn.down_rate = 0;
+        s_turn.src_pos = 0;
+        muse_audio_info_t info = {};
+        size_t reply_len = 0;
+        bool speech = text && text[0] &&
+                      step_tts_fetch(text, s_turn.mp3, TURN_AUDIO_BUF, &reply_len, &info);
+        if (speech && info.kind != MUSE_AUDIO_MP3 && info.rate < 8000) {
+            speech = false;   /* the probe guarantees a rate; never let 0 reach the resampler */
+        }
 
         m.pcm_start = s_turn.pcm_out;
         m.pcm_frames = 0;
         m.tts = TTS_ACTIVE;
         s_turn.tts_msg = i;
         s_turn.silent = !speech;
-        s_turn.mp3_len = 0;
-        s_turn.mp3_ended = false;
-        s_turn.kbps = 0;
-        s_turn.down_rate = 0;
+        s_turn.src_kind = speech ? info.kind : MUSE_AUDIO_UNSUPPORTED;
+        s_turn.src_rate = speech ? info.rate : 0;
+        s_turn.src_channels = speech ? info.channels : 0;
         mp3dec_init(&s_turn.dec);
         if (speech) {
-            tts_data(audio, audio_len);
+            /* The buffer holds the whole reply: the data chunk for WAV, the
+             * whole body for bare PCM, from its first byte for MP3. */
+            s_turn.mp3_len = info.offset + info.length;
+            s_turn.src_pos = info.offset;
             s_turn.mp3_ended = true;
-            free(audio);
             ESP_LOGI(TAG, "speaking message %s (%u chars)", m.id, (unsigned)m.len);
         } else {
             m.pcm_frames = (uint32_t)(m.len * MIC_RATE / TEXT_CHARS_PER_S);
@@ -1693,9 +2070,9 @@ static void start_tts(void)
 
 static void tts_data(const uint8_t *data, size_t len)
 {
-    if (s_turn.mp3_len + len > MP3_BUF) {
+    if (s_turn.mp3_len + len > TURN_AUDIO_BUF) {
         ESP_LOGW(TAG, "MP3 buffer full, dropping %u bytes", (unsigned)len);
-        len = MP3_BUF - s_turn.mp3_len;
+        len = TURN_AUDIO_BUF - s_turn.mp3_len;
     }
     mark(M_MP3);
     memcpy(s_turn.mp3 + s_turn.mp3_len, data, len);
@@ -1736,6 +2113,8 @@ static void pace_silently(void)
 }
 
 /* Decodes buffered MP3 while the reply buffer has room. */
+static void decode_pcm(void);
+
 static void decode(void)
 {
     if (s_turn.tts_msg < 0) {
@@ -1743,6 +2122,10 @@ static void decode(void)
     }
     if (s_turn.silent) {
         pace_silently();
+        return;
+    }
+    if (s_turn.src_kind != MUSE_AUDIO_MP3) {
+        decode_pcm();
         return;
     }
     /*
@@ -1796,6 +2179,67 @@ static void decode(void)
     }
     if (s_turn.mp3_ended && !s_turn.mp3_len) {
         m.pcm_frames = s_turn.pcm_out - m.pcm_start;
+        m.tts = TTS_FINISHED;
+        s_turn.tts_msg = -1;
+    }
+}
+
+/* Plays a buffered WAV/PCM16 reply: up to 1152 interleaved 16-bit samples a
+ * pass, stereo folded to mono, resampled from the probed rate to MIC_RATE. The
+ * whole reply is already in s_turn.mp3, so the byte cursor is all the state:
+ * it starts at the data chunk and ends at the end of the reply.
+ * The flow control is the MP3 path's: stop while the reply buffer is full. */
+static void decode_pcm(void)
+{
+    size_t frame_bytes = (size_t)(s_turn.src_channels ? s_turn.src_channels : 1) * sizeof(int16_t);
+    /* Upsampling writes more samples than it reads, so the chunk is limited to
+     * what the output buffer holds: at most MIC_RATE/src_rate times the input,
+     * so the resampler can never write past s_pcm16. */
+    size_t max_mono = TTS_PCM_CHUNK_SAMPLES;
+    if (s_turn.src_rate && s_turn.src_rate < MIC_RATE) {
+        max_mono = (size_t)((uint64_t)TTS_PCM_CHUNK_SAMPLES * s_turn.src_rate / MIC_RATE);
+        if (!max_mono) {
+            max_mono = 1;
+        }
+    }
+    while (s_turn.mp3_len - s_turn.src_pos >= frame_bytes &&
+           xStreamBufferSpacesAvailable(s_out) >= (MINIMP3_MAX_SAMPLES_PER_FRAME + 8) * sizeof(int16_t)) {
+        size_t avail = (s_turn.mp3_len - s_turn.src_pos) / sizeof(int16_t);
+        size_t mono = (s_turn.src_channels == 2) ? avail / 2 : avail;
+        if (mono > max_mono) {
+            mono = max_mono;
+        }
+        size_t samples = (s_turn.src_channels == 2) ? mono * 2 : mono;
+        if (!samples) {
+            break;
+        }
+        /* A data chunk can start at any offset, so copy instead of casting. */
+        memcpy(s_pcm, s_turn.mp3 + s_turn.src_pos, samples * sizeof(int16_t));
+        if (s_turn.src_channels == 2) {
+            for (size_t k = 0; k < mono; k++) {
+                s_pcm[k] = (int16_t)((s_pcm[2 * k] + s_pcm[2 * k + 1]) / 2);
+            }
+        }
+        if (s_turn.down_rate != (int)s_turn.src_rate) {
+            ESP_LOGI(TAG, "reply audio: %u Hz, %u ch, PCM", (unsigned)s_turn.src_rate,
+                     (unsigned)s_turn.src_channels);
+            s_turn.down_rate = (int)s_turn.src_rate;
+            resampler_init(&s_turn.down, (int)s_turn.src_rate, MIC_RATE);
+        }
+        size_t n = resample(&s_turn.down, s_pcm, mono, s_pcm16);
+        if (s_turn.gen == s_gen.load()) {
+            mark(M_AUDIO);
+            xStreamBufferSend(s_out, s_pcm16, n * sizeof(int16_t), 0);
+        }
+        s_turn.pcm_out += (uint32_t)n;
+        s_turn.src_pos += samples * sizeof(int16_t);
+    }
+    msg_t &m = s_turn.msgs[s_turn.tts_msg];
+    m.pcm_frames = s_turn.pcm_out - m.pcm_start;   /* actual frames, no estimate */
+    if (s_turn.mp3_len - s_turn.src_pos < frame_bytes) {
+        s_turn.src_pos = s_turn.mp3_len;   /* a trailing partial frame is not playable */
+    }
+    if (s_turn.src_pos >= s_turn.mp3_len) {
         m.tts = TTS_FINISHED;
         s_turn.tts_msg = -1;
     }
@@ -1994,7 +2438,7 @@ static bool poll_socket(void)
     static HeaderView hdrs[16];
     for (int budget = 0; budget < 8; budget++) {
         /* Hold off while the MP3 buffer is nearly full: TCP pushes back on the VM. */
-        if (s_turn.tts_msg >= 0 && MP3_BUF - s_turn.mp3_len < MP3_POLL_ROOM) {
+        if (s_turn.tts_msg >= 0 && TURN_AUDIO_BUF - s_turn.mp3_len < MP3_POLL_ROOM) {
             return true;
         }
         ssize_t n = ws_recv(s_conn.tls, s_conn.rx, SCRATCH, false);
@@ -2195,32 +2639,49 @@ extern "C" void muse_hatch_start(void)
      * mbedTLS can exhaust: when the allocation failed here hatch_task never
      * started and every turn was silently dropped. Fall back to internal RAM
      * on parts without usable PSRAM. */
+    bool ok = true;
+#define NEED(cond, what) do { if (!(cond)) { ESP_LOGE(TAG, "start failed: no room for %s", what); ok = false; } } while (0)
     s_cmds = xQueueCreateWithCaps(16, sizeof(cmd_t), MALLOC_CAP_SPIRAM);
     if (!s_cmds) {
         s_cmds = xQueueCreate(16, sizeof(cmd_t));
     }
+    NEED(s_cmds, "the command queue");
     s_events = xQueueCreateWithCaps(16, sizeof(ev_t), MALLOC_CAP_SPIRAM);
     if (!s_events) {
         s_events = xQueueCreate(16, sizeof(ev_t));
     }
+    NEED(s_events, "the event queue");
     s_in = xStreamBufferCreateWithCaps(IN_BYTES, 1, MALLOC_CAP_SPIRAM);
+    NEED(s_in, "the audio input");
     s_out = xStreamBufferCreateWithCaps(OUT_BYTES, 1, MALLOC_CAP_SPIRAM);
+    NEED(s_out, "the audio output");
     s_turn.chunk = static_cast<uint8_t *>(psram_alloc(DICT_CHUNK_BYTES + sizeof(MUSE_HATCH_NOTE_TAIL)));
-    s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(MP3_BUF));
+    NEED(s_turn.chunk, "the reply buffer");
+    s_turn.mp3 = static_cast<uint8_t *>(psram_alloc(TURN_AUDIO_BUF));
+    NEED(s_turn.mp3, "the audio buffer");
     s_turn.note = VOICE_NOTE ? static_cast<uint8_t *>(psram_alloc(NOTE_PART_BYTES)) : nullptr;
+    NEED(!VOICE_NOTE || s_turn.note, "the note buffer");
     s_turn.texts = static_cast<char *>(psram_alloc(MAX_MSGS * TEXT_MAX));   /* captions just stay untimed without it */
     s_pcm = static_cast<int16_t *>(psram_alloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t)));
+    NEED(s_pcm, "the mp3 scratch");
     s_pcm16 = static_cast<int16_t *>(psram_alloc((MINIMP3_MAX_SAMPLES_PER_FRAME + 8) * sizeof(int16_t)));
+    NEED(s_pcm16, "the pcm scratch");
     for (auto &s : s_streams) {
         s.line = static_cast<char *>(psram_alloc(NDJSON_LINE_MAX));
         s.cap = NDJSON_LINE_MAX;
     }
     s_turn.tts_msg = -1;
+#undef NEED
+    /* Half a session is worse than none: with a queue or a buffer missing, the
+     * chat task would walk into a null pointer on its first turn. */
+    if (!ok) {
+        ESP_LOGE(TAG, "the chat session did not start");
+        return;
+    }
     /* Stack in PSRAM: TLS, Noise and the MP3 decoder (~16 KB of scratch) all run here. */
-    if (!s_cmds || !s_events || !s_in || !s_out || !s_turn.chunk || !s_turn.mp3 || (VOICE_NOTE && !s_turn.note) || !s_pcm || !s_pcm16 ||
-        xTaskCreatePinnedToCoreWithCaps(hatch_task, "muse_chat", 48 * 1024, nullptr, 5, nullptr, 0,
+    if (xTaskCreatePinnedToCoreWithCaps(hatch_task, "muse_chat", 48 * 1024, nullptr, 5, nullptr, 0,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
-        ESP_LOGE(TAG, "start failed");
+        ESP_LOGE(TAG, "start failed: no room for the chat task");
     }
 }
 

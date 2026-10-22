@@ -76,3 +76,8 @@ CONFIG_LV_USE_QRCODE=y
 
 # AIPI replies are Chinese: captions and replies draw CJK from Unifont.
 CONFIG_MUSE_CJK_FONT=y
+
+# A reply is held whole before it is played, and raw PCM at 24 kHz uses about
+# 48 KB a second: 512 KB holds ten seconds of it, which cuts a reply off
+# mid-sentence. The 8 MB PSRAM here has room for forty.
+CONFIG_MUSE_TTS_REPLY_BUF_KB=2048

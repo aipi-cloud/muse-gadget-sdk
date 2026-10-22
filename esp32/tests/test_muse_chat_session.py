@@ -35,6 +35,7 @@ class ChatSession(unittest.TestCase):
 #include "host_compat.h"
 #include "cJSON.h"
 #include "minimp3.h"
+#include "muse_audio_format.h"
 #include "muse_chat_priv.h"
 #define ESP_LOGI(...) ((void)0)
 ''' + constants + types + r'''

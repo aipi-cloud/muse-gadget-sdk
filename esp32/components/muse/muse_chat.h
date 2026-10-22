@@ -112,6 +112,25 @@ size_t muse_hatch_turn_read(int16_t *pcm, size_t frames, int wait_ms);
 /* Bench test: decodes a built-in MP3 to 16 kHz; caller frees *pcm. Returns frames. */
 size_t muse_hatch_mp3_selftest(int16_t **pcm);
 
+/* ---- TTS health, for the serial console (CONFIG_MUSE_HATCH only) ---- */
+
+/*
+ * Real request with the current NVS config. Text is a fixed short phrase.
+ * Never plays audio. Blocking; call from the console task only. On success
+ * *format_out is "mp3", "wav" or "pcm". On failure *status_out is the HTTP
+ * status (0 when the request never connected), *format_out the probe's reason
+ * for an unplayable reply ("ogg", "wav-codec", ..., or ""), and `detail` the
+ * failure reason (the body of an HTTP error, cut to 120 chars, or a short
+ * word such as "offline", "unconfigured", "connect", "empty", "busy"). The key
+ * is never read back into any of them.
+ */
+bool muse_tts_probe(int *status_out, size_t *bytes_out, const char **format_out,
+                    int *ms_out, char *detail, size_t detail_cap);
+
+/* One-line JSON object body for "@tts {...}", appended as "last". Never
+ * includes the key. */
+void muse_tts_last_json(char *out, size_t cap);
+
 /*
  * As muse_hatch_turn_audio, for a note recorded before the turn began: takes
  * what fits of it, waiting up to wait_ms for room if not all of it does, and

@@ -323,6 +323,7 @@ class HatchVoiceNote(NoteRequestAssertions, unittest.TestCase):
 #include <cstring>
 #include "host_compat.h"
 #include "minimp3.h"
+#include "muse_audio_format.h"
 #include "muse_chat_priv.h"
 #define ESP_LOGI(...) ((void)0)
 /* Not assert(): the fakes must still check under -DNDEBUG. */
