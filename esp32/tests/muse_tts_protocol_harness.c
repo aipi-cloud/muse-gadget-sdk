@@ -140,6 +140,54 @@ static void check_body(void)
     }
 }
 
+/*
+ * An empty voice name is left out of the request, so the service applies its
+ * own default voice: an empty name is refused.
+ */
+static void check_body_empty_voice(void)
+{
+    char body[512];
+
+    /* OpenAI: no "voice" member at all, and no comma left behind. */
+    if (!muse_tts_build_body(MUSE_TTS_API_OPENAI, "m", "", "Hi.", NULL, body, sizeof(body))) {
+        fail("body_openai_novoice", "returned false");
+    } else {
+        check_str("body_openai_novoice", body, "{\"model\":\"m\",\"input\":\"Hi.\"}");
+        if (strstr(body, "\"voice\"")) {
+            fail("body_openai_novoice", "the voice member is still there");
+        }
+        if (strstr(body, ",,") || strstr(body, ",}")) {
+            fail("body_openai_novoice", "a stray comma is left behind");
+        }
+    }
+    /* The rest of the request is unchanged: the format is still asked for. */
+    if (!muse_tts_build_body(MUSE_TTS_API_OPENAI, "m", "", "Hi.", "mp3", body, sizeof(body))) {
+        fail("body_openai_novoice_fmt", "returned false");
+    } else {
+        check_str("body_openai_novoice_fmt", body,
+                  "{\"model\":\"m\",\"input\":\"Hi.\",\"response_format\":\"mp3\"}");
+    }
+    /* A NULL voice is the same as an empty one. */
+    if (!muse_tts_build_body(MUSE_TTS_API_OPENAI, "m", NULL, "Hi.", NULL, body, sizeof(body))) {
+        fail("body_openai_nullvoice", "returned false");
+    } else {
+        check_str("body_openai_nullvoice", body, "{\"model\":\"m\",\"input\":\"Hi.\"}");
+    }
+
+    /* Gemini: no speechConfig at all. */
+    if (!muse_tts_build_body(MUSE_TTS_API_GEMINI, "gemini-3.8-flash-tts", "", "Hi.", NULL, body,
+                             sizeof(body))) {
+        fail("body_gemini_novoice", "returned false");
+    } else {
+        check_str("body_gemini_novoice", body,
+                  "{\"contents\":[{\"parts\":[{\"text\":\"Hi.\"}]}],"
+                  "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]}}");
+        if (strstr(body, "speechConfig")) {
+            fail("body_gemini_novoice", "speechConfig is still there");
+        }
+    }
+}
+
 static void check_extract_openai(void)
 {
     static const uint8_t audio[] = { 'R', 'I', 'F', 'F', 1, 2, 3, 4 };
@@ -306,6 +354,7 @@ int main(void)
     check_api_parse();
     check_auth();
     check_body();
+    check_body_empty_voice();
     check_extract_openai();
     check_extract_gemini();
     check_gemini_pcm_chain();

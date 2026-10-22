@@ -150,6 +150,7 @@ static bool json_raw(char **p, char *end, const char *raw)
     return true;
 }
 
+/* An empty voice is left out of the request, so the service uses its own default. */
 bool muse_tts_build_body(muse_tts_api_t api, const char *model, const char *voice,
                          const char *text, const char *format, char *out, size_t cap)
 {
@@ -159,21 +160,28 @@ bool muse_tts_build_body(muse_tts_api_t api, const char *model, const char *voic
     out[0] = '\0';
     char *p = out;
     char *end = out + cap - 1;   /* room for the NUL */
+    bool have_voice = voice && voice[0];
 
     if (api == MUSE_TTS_API_GEMINI) {
         if (!json_raw(&p, end, "{\"contents\":[{\"parts\":[{\"text\":")) return false;
         if (!json_string(&p, end, text)) return false;
-        if (!json_raw(&p, end, "}]}],\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],")) return false;
-        if (!json_raw(&p, end, "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoice\":{\"voiceName\":")) return false;
-        if (!json_string(&p, end, voice)) return false;
-        if (!json_raw(&p, end, "}}}}}")) return false;
+        if (!json_raw(&p, end, "}]}],\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]")) return false;
+        if (have_voice) {
+            if (!json_raw(&p, end, ",\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoice\":{\"voiceName\":")) return false;
+            if (!json_string(&p, end, voice)) return false;
+            if (!json_raw(&p, end, "}}}}}")) return false;
+        } else {
+            if (!json_raw(&p, end, "}}")) return false;
+        }
     } else {
         if (!json_raw(&p, end, "{\"model\":")) return false;
         if (!json_string(&p, end, model)) return false;
         if (!json_raw(&p, end, ",\"input\":")) return false;
         if (!json_string(&p, end, text)) return false;
-        if (!json_raw(&p, end, ",\"voice\":")) return false;
-        if (!json_string(&p, end, voice)) return false;
+        if (have_voice) {
+            if (!json_raw(&p, end, ",\"voice\":")) return false;
+            if (!json_string(&p, end, voice)) return false;
+        }
         if (format && format[0]) {
             if (!json_raw(&p, end, ",\"response_format\":")) return false;
             if (!json_string(&p, end, format)) return false;
