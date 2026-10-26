@@ -167,7 +167,7 @@ bool muse_tts_build_body(muse_tts_api_t api, const char *model, const char *voic
         if (!json_string(&p, end, text)) return false;
         if (!json_raw(&p, end, "}]}],\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]")) return false;
         if (have_voice) {
-            if (!json_raw(&p, end, ",\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoice\":{\"voiceName\":")) return false;
+            if (!json_raw(&p, end, ",\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":")) return false;
             if (!json_string(&p, end, voice)) return false;
             if (!json_raw(&p, end, "}}}}}")) return false;
         } else {

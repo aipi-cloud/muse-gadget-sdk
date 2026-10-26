@@ -124,7 +124,17 @@ static void check_body(void)
         check_str("body_gemini", body,
                   "{\"contents\":[{\"parts\":[{\"text\":\"Hi.\"}]}],"
                   "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],"
-                  "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoice\":{\"voiceName\":\"Kore\"}}}}}");
+                  "\"speechConfig\":{\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":\"Kore\"}}}}}");
+        /* Google's proto names this field "prebuiltVoiceConfig". The service
+         * answers HTTP 400 ("Unknown name \"prebuiltVoice\"") for any other
+         * name, so the field name is pinned here. The needle keeps the closing
+         * quote: "prebuiltVoiceConfig" contains "prebuiltVoice" as a prefix. */
+        if (!strstr(body, "\"prebuiltVoiceConfig\":")) {
+            fail("body_gemini", "the voice config field is not prebuiltVoiceConfig");
+        }
+        if (strstr(body, "\"prebuiltVoice\":")) {
+            fail("body_gemini", "the old prebuiltVoice field is still there");
+        }
     }
     /* The text comes from a chat reply: quotes and newlines have to survive. */
     if (!muse_tts_build_body(MUSE_TTS_API_OPENAI, "m", "v", "say \"hi\"\nnow", "mp3", body, sizeof(body))) {

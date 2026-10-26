@@ -116,6 +116,13 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 # TLS: root CA bundle for HTTPS / WSS / OTA.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# The bundle lookup is keyed on the issuer name of the chain's top certificate.
+# Google serves a "GTS Root R4" that is cross-signed by "GlobalSign Root CA",
+# and that issuer is not a bundle anchor, so the chain fails to anchor and every
+# Google-fronted host (api.openai.com, generativelanguage.googleapis.com) is
+# unreachable. Cross-signed verification resolves the chain against the
+# self-signed twin already in the bundle and stops at the intermediate.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
 
 # TLS record sizes. Outbound was 4 KB but each TLS record carries
 # encrypt/MAC/header overhead — 16 KB records cut that overhead 4x.
